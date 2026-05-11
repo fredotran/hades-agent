@@ -32,6 +32,9 @@ RUN pip install --no-cache-dir /wheels/*
 # Create a non-root user for runtime
 RUN useradd --create-home --shell /bin/bash -u 1000 hermes || true
 
+# Ensure HERMES_HOME exists and is owned by the hermes user so runtime can write logs
+RUN mkdir -p /home/hermes/.hermes && chown -R hermes:hermes /home/hermes/.hermes
+
 WORKDIR /opt/hermes
 COPY --chown=hermes:hermes . /opt/hermes
 
