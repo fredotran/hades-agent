@@ -1,0 +1,38 @@
+name: Security checks (pre-commit + Trivy)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install pre-commit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pre-commit
+
+      - name: Run pre-commit
+        run: pre-commit run --all-files
+
+      - name: Run Trivy filesystem scan (vuln + secret)
+        uses: aquasecurity/trivy-action@v2
+        with:
+          scan-type: 'fs'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          security-checks: 'vuln,secret'
+          cache-dir: ${{ runner.temp }}/trivy-cache

@@ -90,6 +90,19 @@ fi
 # boot.  The `[ ! -f ... ]` guard is critical: without it, a container
 # restart would clobber a rotated refresh token with the now-stale value
 # the orchestrator originally seeded.
+#
+# Support Docker secrets: if the env var is unset but a file exists at
+# /run/secrets/HERMES_AUTH_JSON_BOOTSTRAP, read it and use that as the
+# bootstrap payload.  Likewise allow API_SERVER_KEY to be supplied via
+# /run/secrets/API_SERVER_KEY so secrets never need to be passed via env.
+if [ -z "${HERMES_AUTH_JSON_BOOTSTRAP:-}" ] && [ -f "/run/secrets/HERMES_AUTH_JSON_BOOTSTRAP" ]; then
+    HERMES_AUTH_JSON_BOOTSTRAP="$(cat /run/secrets/HERMES_AUTH_JSON_BOOTSTRAP)"
+    export HERMES_AUTH_JSON_BOOTSTRAP
+fi
+if [ -z "${API_SERVER_KEY:-}" ] && [ -f "/run/secrets/API_SERVER_KEY" ]; then
+    API_SERVER_KEY="$(cat /run/secrets/API_SERVER_KEY)"
+    export API_SERVER_KEY
+fi
 if [ ! -f "$HERMES_HOME/auth.json" ] && [ -n "$HERMES_AUTH_JSON_BOOTSTRAP" ]; then
     printf '%s' "$HERMES_AUTH_JSON_BOOTSTRAP" > "$HERMES_HOME/auth.json"
     chmod 600 "$HERMES_HOME/auth.json"
