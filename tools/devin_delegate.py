@@ -6,17 +6,21 @@ agent-friendly operations with:
   - Model fallback on quota exhaustion
   - Incremental output polling
   - Clean result parsing
+  - Exponential-backoff polling
+  - Config-driven defaults
+  - Process-exit cleanup
 
 These tools assume the oh-my-opendevin Devin MCP server is already connected
 (via auto-discovery in tools/mcp_tool.py or manual config).
 """
 
+import atexit
 import json
 import logging
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from tools.registry import registry
 
@@ -24,11 +28,15 @@ logger = logging.getLogger(__name__)
 
 # Devin model fallback chain (same as oh-my-opendevin tiers.ts)
 _DEVIN_FALLBACK_CHAIN = ["opus", "sonnet", "kimi-k2.6", "swe"]
+_KNOWN_DEVIN_MODELS: Set[str] = set(_DEVIN_FALLBACK_CHAIN)
 
 # Max total wait time for devin_delegate (2 hours default)
 _DEFAULT_MAX_WAIT_SECONDS = 7200
-# Poll interval when devin_wait times out
-_POLL_INTERVAL_SECONDS = 5
+# Base poll interval; actual interval grows exponentially up to _MAX_POLL_INTERVAL
+_BASE_POLL_INTERVAL_SECONDS = 2
+_MAX_POLL_INTERVAL_SECONDS = 60
+# Bindings older than this are auto-purged by the monitor
+_BINDING_TTL_SECONDS = 86400  # 24 hours
 
 
 def _find_devin_mcp_tool(base_name: str) -> Optional[str]:
@@ -115,6 +123,128 @@ def _get_next_fallback_model(current: str) -> Optional[str]:
     return None
 
 
+def _validate_devin_model(model: Optional[str]) -> Optional[str]:
+    """Validate and normalise a Devin model name.
+
+    Returns the validated model, or None if the input was empty.
+    Warns and returns None for unknown models so the caller can fall
+    back to the config-driven default.
+    """
+    if not model:
+        return None
+    m = model.strip().lower()
+    if m in _KNOWN_DEVIN_MODELS:
+        return m
+    # Accept fully-qualified IDs like "swe-1-6" by prefix match
+    for known in _KNOWN_DEVIN_MODELS:
+        if m.startswith(known):
+            return known
+    logger.warning(
+        "Unknown Devin model %r; expected one of %s. "
+        "Falling back to default.",
+        model, list(_KNOWN_DEVIN_MODELS),
+    )
+    return None
+
+
+def _get_config() -> Dict[str, Any]:
+    """Load Hermes config.yaml (cached per-process)."""
+    try:
+        from hermes_cli.config import get_config_path
+        cfg_path = get_config_path()
+        if cfg_path.exists():
+            import yaml
+            with open(cfg_path, encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.debug("Could not load Hermes config: %s", exc)
+    return {}
+
+
+# Process-level cache for config reads
+_config_cache: Optional[Dict[str, Any]] = None
+_config_cache_time: float = 0.0
+_CONFIG_CACHE_TTL: float = 5.0  # seconds
+
+
+def _get_cached_config() -> Dict[str, Any]:
+    """Return config, refreshing the cache if older than TTL."""
+    global _config_cache, _config_cache_time
+    now = time.monotonic()
+    if _config_cache is None or (now - _config_cache_time) > _CONFIG_CACHE_TTL:
+        _config_cache = _get_config()
+        _config_cache_time = now
+    return _config_cache
+
+
+def _get_default_model() -> str:
+    """Return the default Devin model from config, or 'kimi-k2.6'."""
+    cfg = _get_cached_config()
+    # Support both delegation.devin_model and top-level devin.model
+    for path in ("delegation.devin_model", "devin.model"):
+        keys = path.split(".")
+        node = cfg
+        for k in keys:
+            if isinstance(node, dict):
+                node = node.get(k)
+            else:
+                node = None
+                break
+        if isinstance(node, str) and node:
+            validated = _validate_devin_model(node)
+            if validated:
+                return validated
+    return "kimi-k2.6"
+
+
+def _compute_poll_interval(iteration: int) -> float:
+    """Return the poll sleep duration for the *iteration*th poll loop.
+
+    Exponential backoff capped at _MAX_POLL_INTERVAL_SECONDS.
+    """
+    return min(_BASE_POLL_INTERVAL_SECONDS * (2 ** iteration), _MAX_POLL_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Process-exit cleanup: track Devin sessions started by this process
+# ---------------------------------------------------------------------------
+_active_devin_sessions: Set[str] = set()
+_sessions_lock = threading.Lock()
+
+
+def _track_session(session_id: str) -> None:
+    """Register a session ID for atexit cancellation."""
+    if not session_id:
+        return
+    with _sessions_lock:
+        _active_devin_sessions.add(session_id)
+
+
+def _untrack_session(session_id: str) -> None:
+    """Remove a session ID from the atexit watchlist."""
+    with _sessions_lock:
+        _active_devin_sessions.discard(session_id)
+
+
+def _cancel_tracked_sessions() -> None:
+    """Cancel all Devin sessions started by this process on exit.
+
+    Registered with atexit so SIGTERM / normal exit cleans up gracefully.
+    """
+    with _sessions_lock:
+        sessions = list(_active_devin_sessions)
+        _active_devin_sessions.clear()
+    for sid in sessions:
+        try:
+            logger.info("Cancelling Devin session %s at process exit", sid)
+            _call_devin_mcp("devin_cancel", {"session_id": sid})
+        except Exception as exc:
+            logger.debug("Failed to cancel Devin session %s at exit: %s", sid, exc)
+
+
+atexit.register(_cancel_tracked_sessions)
+
+
 def _start_devin_session(
     prompt: str,
     model: Optional[str] = None,
@@ -125,9 +255,11 @@ def _start_devin_session(
     auto_fallback: bool = True,
 ) -> dict:
     """Start a Devin session, with optional manual fallback on quota errors."""
-    args: dict = {"prompt": prompt}
-    if model:
-        args["model"] = model
+    # Validate / normalise model, then fall back to config default
+    validated = _validate_devin_model(model)
+    resolved_model = validated or _get_default_model()
+
+    args: dict = {"prompt": prompt, "model": resolved_model}
     if cwd:
         args["cwd"] = cwd
     if permission_mode:
@@ -144,22 +276,26 @@ def _start_devin_session(
     # Check for quota errors even when auto_fallback was passed
     # (older MCP servers might not support it)
     if "QUOTA_EXCEEDED" in text and not auto_fallback:
-        return {"error": text, "quota_exceeded": True, "model": model}
+        return {"error": text, "quota_exceeded": True, "model": resolved_model}
 
     if "error" in result or "FAILED" in text:
         # Check if it's a quota error that we should retry manually
         if "QUOTA_EXCEEDED" in text or "quota exceeded" in text.lower():
-            return {"error": text, "quota_exceeded": True, "model": model}
+            return {"error": text, "quota_exceeded": True, "model": resolved_model}
         return {"error": text}
 
     # Parse session_id from the response text
     snap = _parse_snapshot(text)
     session_id = snap.get("session_id", "")
 
+    # Track for atexit cleanup
+    _track_session(session_id)
+
     return {
         "session_id": session_id,
         "snapshot": snap,
         "raw": text,
+        "model": resolved_model,
     }
 
 
@@ -310,7 +446,7 @@ def devin_delegate(
             "raw": start_result.get("raw", ""),
         }, ensure_ascii=False)
 
-    resolved_model = start_result.get("snapshot", {}).get("model", current_model or "kimi-k2.6")
+    resolved_model = start_result.get("model", current_model or _get_default_model())
 
     if not wait:
         # Fire-and-forget: bind for async completion notification
@@ -325,53 +461,60 @@ def devin_delegate(
             "duration_seconds": round(time.monotonic() - start_time, 2),
         }, ensure_ascii=False)
 
-    # Wait loop
+    # Wait loop with exponential-backoff polling
     total_wait_limit = _DEFAULT_MAX_WAIT_SECONDS
     deadline = start_time + total_wait_limit
     last_output_bytes = 0
+    poll_iteration = 0
 
-    while time.monotonic() < deadline:
-        wait_result = _wait_devin_session(session_id, timeout_ms=30000)
+    try:
+        while time.monotonic() < deadline:
+            wait_result = _wait_devin_session(session_id, timeout_ms=30000)
 
-        if "error" in wait_result:
-            return json.dumps({
-                "session_id": session_id,
-                "status": "error",
-                "summary": wait_result["error"],
-                "model": resolved_model,
-                "duration_seconds": round(time.monotonic() - start_time, 2),
-            }, ensure_ascii=False)
+            if "error" in wait_result:
+                return json.dumps({
+                    "session_id": session_id,
+                    "status": "error",
+                    "summary": wait_result["error"],
+                    "model": resolved_model,
+                    "duration_seconds": round(time.monotonic() - start_time, 2),
+                }, ensure_ascii=False)
 
-        if wait_result.get("exited"):
-            status = wait_result.get("status", "unknown")
-            output = wait_result.get("output", "")
-            return json.dumps({
-                "session_id": session_id,
-                "status": status,
-                "summary": output,
-                "model": resolved_model,
-                "duration_seconds": round(time.monotonic() - start_time, 2),
-            }, ensure_ascii=False)
+            if wait_result.get("exited"):
+                status = wait_result.get("status", "unknown")
+                output = wait_result.get("output", "")
+                return json.dumps({
+                    "session_id": session_id,
+                    "status": status,
+                    "summary": output,
+                    "model": resolved_model,
+                    "duration_seconds": round(time.monotonic() - start_time, 2),
+                }, ensure_ascii=False)
 
-        # Still running — poll incrementally for progress
-        poll_result = _poll_devin_status(session_id, since_bytes=last_output_bytes)
-        if "error" not in poll_result:
-            last_output_bytes = poll_result.get("output_bytes", last_output_bytes)
+            # Still running — poll incrementally for progress
+            poll_result = _poll_devin_status(session_id, since_bytes=last_output_bytes)
+            if "error" not in poll_result:
+                last_output_bytes = poll_result.get("output_bytes", last_output_bytes)
 
-        # Short sleep before next wait attempt
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
+            # Exponential-backoff sleep capped at _MAX_POLL_INTERVAL_SECONDS
+            poll_iteration += 1
+            sleep_seconds = _compute_poll_interval(poll_iteration)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(sleep_seconds, remaining))
 
-    # Max wait exceeded
-    return json.dumps({
-        "session_id": session_id,
-        "status": "timeout",
-        "summary": f"Devin session {session_id} did not complete within {total_wait_limit}s.",
-        "model": resolved_model,
-        "duration_seconds": round(time.monotonic() - start_time, 2),
-    }, ensure_ascii=False)
+        # Max wait exceeded
+        return json.dumps({
+            "session_id": session_id,
+            "status": "timeout",
+            "summary": f"Devin session {session_id} did not complete within {total_wait_limit}s.",
+            "model": resolved_model,
+            "duration_seconds": round(time.monotonic() - start_time, 2),
+        }, ensure_ascii=False)
+    finally:
+        # Stop tracking for atexit cleanup once we leave the wait loop
+        _untrack_session(session_id)
 
 
 def devin_status_check(
@@ -515,11 +658,29 @@ def _devin_monitor_loop() -> None:
 
 
 def _check_pending_sessions() -> None:
-    """Poll all bound Devin sessions; notify and unbind those that have completed."""
+    """Poll all bound Devin sessions; notify and unbind those that have completed.
+
+    Also purges bindings older than _BINDING_TTL_SECONDS to prevent
+    unbounded memory growth when the MCP server restarts or sessions
+    are lost.
+    """
     bindings = get_session_bindings()
     if not bindings:
         return
+
+    now = time.time()
     for session_id, meta in list(bindings.items()):
+        # TTL purge: silently drop ancient bindings
+        bound_at = meta.get("bound_at", 0)
+        if now - bound_at > _BINDING_TTL_SECONDS:
+            logger.debug(
+                "Purging stale Devin binding %s (bound %.0fh ago)",
+                session_id, (now - bound_at) / 3600,
+            )
+            unbind_session(session_id)
+            _untrack_session(session_id)
+            continue
+
         try:
             result = _poll_devin_status(session_id, since_bytes=0)
         except Exception as exc:
@@ -530,6 +691,7 @@ def _check_pending_sessions() -> None:
         if status in ("completed", "error", "cancelled"):
             _notify_completion(session_id, meta, result)
             unbind_session(session_id)
+            _untrack_session(session_id)
 
 
 # Optional fallback callback for notifications when the gateway is unavailable.

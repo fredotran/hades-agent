@@ -884,7 +884,15 @@ class DevinSubagent:
                  progress_cb, parent_print_fn,
                  platform=None, chat_id=None, thread_id=None, **extra):
         self.goal = goal
-        self.model = model or "kimi-k2.6"
+        # Defer to config-driven default if no model is provided
+        if model:
+            self.model = model
+        else:
+            try:
+                from tools.devin_delegate import _get_default_model
+                self.model = _get_default_model()
+            except Exception:
+                self.model = "kimi-k2.6"
         self._subagent_id = subagent_id
         self._parent_subagent_id = parent_subagent_id
         self._delegate_role = "devin"
@@ -902,8 +910,21 @@ class DevinSubagent:
         self._chat_id = chat_id
         self._thread_id = thread_id
 
+    def _report_progress(self, desc: str) -> None:
+        """Fire the parent progress callback if one was provided."""
+        if self.tool_progress_callback:
+            try:
+                self.tool_progress_callback(
+                    tool_name="devin_delegate",
+                    status="running",
+                    result=desc,
+                )
+            except Exception:
+                pass
+
     def run_conversation(self, user_message: str, task_id: Optional[str] = None) -> dict:
         """Call devin_delegate and return an AIAgent-compatible result dict."""
+        self._report_progress("Starting Devin session...")
         from tools.devin_delegate import devin_delegate
         result_str = devin_delegate(
             prompt=user_message,

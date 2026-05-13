@@ -639,3 +639,125 @@ class TestLiveMcpSmoke:
         core = {"devin_start", "devin_status", "devin_wait", "devin_cancel"}
         missing = core - found
         assert not missing, f"Core Devin MCP tools missing from server response: {missing}\n\nstdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Model validation
+# ---------------------------------------------------------------------------
+
+class TestModelValidation:
+    """Tests for _validate_devin_model and _get_default_model."""
+
+    def test_known_models_accepted(self):
+        """Valid Devin tier keywords are accepted."""
+        import tools.devin_delegate as ddg
+        assert ddg._validate_devin_model("opus") == "opus"
+        assert ddg._validate_devin_model("sonnet") == "sonnet"
+        assert ddg._validate_devin_model("kimi-k2.6") == "kimi-k2.6"
+        assert ddg._validate_devin_model("swe") == "swe"
+
+    def test_fully_qualified_id_by_prefix(self):
+        """Fully-qualified IDs like 'swe-1-6' match by prefix."""
+        import tools.devin_delegate as ddg
+        assert ddg._validate_devin_model("swe-1-6") == "swe"
+        assert ddg._validate_devin_model("opus-latest") == "opus"
+
+    def test_empty_returns_none(self):
+        """Empty/None model returns None to trigger fallback."""
+        import tools.devin_delegate as ddg
+        assert ddg._validate_devin_model("") is None
+        assert ddg._validate_devin_model(None) is None
+
+    def test_unknown_warns_and_returns_none(self):
+        """Unknown models return None after warning."""
+        import tools.devin_delegate as ddg
+        assert ddg._validate_devin_model("gpt-4") is None
+        assert ddg._validate_devin_model("unknown") is None
+
+    def test_default_model_is_known(self):
+        """_get_default_model always returns a known model."""
+        import tools.devin_delegate as ddg
+        default = ddg._get_default_model()
+        assert default in ddg._KNOWN_DEVIN_MODELS
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff
+# ---------------------------------------------------------------------------
+
+class TestExponentialBackoff:
+    """Tests for _compute_poll_interval."""
+
+    def test_backoff_grows_then_caps(self):
+        """Poll interval doubles each iteration up to the cap."""
+        import tools.devin_delegate as ddg
+
+        assert ddg._compute_poll_interval(0) == ddg._BASE_POLL_INTERVAL_SECONDS
+        assert ddg._compute_poll_interval(1) == 4
+        assert ddg._compute_poll_interval(2) == 8
+        assert ddg._compute_poll_interval(5) == 64
+        # Should cap at _MAX_POLL_INTERVAL_SECONDS
+        assert ddg._compute_poll_interval(10) == ddg._MAX_POLL_INTERVAL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Session tracking and atexit
+# ---------------------------------------------------------------------------
+
+class TestSessionTracking:
+    """Tests for _track_session / _untrack_session."""
+
+    def test_track_and_untrack(self):
+        """Sessions are tracked and can be untracked."""
+        import tools.devin_delegate as ddg
+        ddg._active_devin_sessions.clear()
+        ddg._track_session("sess-1")
+        assert "sess-1" in ddg._active_devin_sessions
+        ddg._untrack_session("sess-1")
+        assert "sess-1" not in ddg._active_devin_sessions
+
+    def test_duplicate_track_is_noop(self):
+        """Tracking the same session twice is harmless."""
+        import tools.devin_delegate as ddg
+        ddg._active_devin_sessions.clear()
+        ddg._track_session("sess-1")
+        ddg._track_session("sess-1")
+        assert len(ddg._active_devin_sessions) == 1
+        ddg._active_devin_sessions.clear()
+
+
+# ---------------------------------------------------------------------------
+# Binding TTL cleanup
+# ---------------------------------------------------------------------------
+
+class TestBindingTtl:
+    """Tests for automatic purging of stale bindings."""
+
+    def test_old_bindings_purged(self):
+        """Bindings older than _BINDING_TTL_SECONDS are removed."""
+        import tools.devin_delegate as ddg
+
+        ddg._session_bindings.clear()
+        # Inject a very old binding
+        ddg._session_bindings["sess-old"] = {
+            "platform": "telegram", "chat_id": "123",
+            "bound_at": time.time() - ddg._BINDING_TTL_SECONDS - 1,
+        }
+
+        ddg._check_pending_sessions()
+        assert "sess-old" not in ddg._session_bindings
+
+    def test_fresh_bindings_kept(self):
+        """Recent bindings survive the TTL check."""
+        import tools.devin_delegate as ddg
+
+        ddg._session_bindings.clear()
+        ddg._session_bindings["sess-fresh"] = {
+            "platform": "telegram", "chat_id": "123",
+            "bound_at": time.time(),
+        }
+        # Mock poll so we don't actually call MCP
+        with patch.object(ddg, "_poll_devin_status", return_value={"status": "running"}):
+            ddg._check_pending_sessions()
+        assert "sess-fresh" in ddg._session_bindings
+        ddg._session_bindings.clear()
