@@ -334,65 +334,57 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 ## Devin Integration (oh-my-opendevin)
 
 Hermes can delegate tasks to a Devin CLI agent via the oh-my-opendevin repository.
+
+> **Full documentation:** `docs/DEVIN_INTEGRATION.md`
+> **Verification script:** `tests/tools/verify_devin_integration.py`
+
+**Quick start:**
+```bash
+# Verify the integration (safe, no API quota used)
+python3 tests/tools/verify_devin_integration.py
+```
+
 The integration is layered:
 
 **1. MCP server auto-discovery** (`tools/devin_discovery.py`)
-- Searches for `oh-my-opendevin` in 18 common paths (`~/Code/`, `~/repos/`,
-  `~/dev/`, `~/github/`, `~/tools/`, `~/opt/`, etc.)
+- Searches for `oh-my-opendevin` in 18 common paths
 - Honors `OH_MY_OPENDEVIN_PATH` environment variable
-- Validates the repo has `src/mcp-servers/devin/index.ts` and `bin/devin-mcp-launcher.sh`
-- Checks `bun` is on PATH
-- Injects the MCP server config into `discover_mcp_tools()` in `tools/mcp_tool.py`
+- Validates markers and checks `bun` availability
+- Injects MCP server config into `discover_mcp_tools()`
 
-**2. High-level tools** (`tools/devin_delegate.py`)
-- `devin_delegate` — start a Devin session, optionally wait for completion,
-  with automatic model fallback on quota errors, incremental output streaming,
-  and structured error tags (`RATE_LIMIT`, `QUOTA_EXCEEDED`, `CONTEXT_LIMIT`)
-- `devin_status_check` — incremental polling with `since_bytes`
-- `devin_list_sessions` — list managed sessions
-- `devin_cancel` — cancel a running session and remove from monitor
-- `devin_health` — check MCP server health (binary, disk, slots, orphans)
-- `devin_resumable` — list sessions eligible for resumption
-- Registered under the `devin` toolset in `toolsets.py`
+**2. High-level tools** (`tools/devin_delegate.py`) — 6 tools:
+- `devin_delegate` — start/wait, model fallback, streaming, error tags
+- `devin_status_check` — incremental polling
+- `devin_list_sessions` — enumerate sessions
+- `devin_cancel` — cancel + unbind
+- `devin_health` — MCP server health snapshot
+- `devin_resumable` — list resumable sessions
 
 **3. Subagent bridge** (`tools/delegate_tool.py`)
-- `role="devin"` in `delegate_task` routes to `DevinSubagent` instead of `AIAgent`
-- `DevinSubagent` implements the minimal surface `_run_single_child` expects:
-  `run_conversation()`, `interrupt()`, `close()`, `get_activity_summary()`
-- Progress callbacks, heartbeat, timeout handling, and incremental output
-  streaming via `_print_fn` work transparently
+- `role="devin"` routes to `DevinSubagent` (not local `AIAgent`)
+- Full lifecycle: progress callbacks, heartbeat, streaming, timeout
 
-**4. Bidirectional notifications** (`tools/devin_delegate.py` monitor thread)
-- A daemon thread (`devin-monitor`) polls active Devin sessions every 30s
-- On completion, looks up the session's platform/chat_id binding
-- Sends a completion message via the gateway runner's platform adapter
-  (`asyncio.run_coroutine_threadsafe(adapter.send(...), runner._gateway_loop)`)
-- Falls back to a registered callback, then logging if the gateway is unavailable
-- Auto-purges bindings older than 24h to prevent unbounded memory growth
+**4. Bidirectional notifications**
+- Background `devin-monitor` daemon polls every 30s
+- Gateway adapter → registered callback → log fallback
+- Auto-purges stale bindings after 24h
 
 **5. Production hardening**
-- Exponential-backoff polling (base 2s → max 60s) reduces MCP server load
-- Config-driven default model via `delegation.devin_model` or `devin.model`
-  in `~/.hermes/config.yaml` (5s cache)
-- Model validation accepts known tiers (`opus`, `sonnet`, `kimi-k2.6`, `swe`)
-  and fully-qualified IDs by prefix (e.g. `swe-1-6`)
-- `atexit` handler cancels all Devin sessions started by this process on exit
+- Exponential-backoff polling (2s → 60s cap)
+- Config-driven default model (`devin.model` in config.yaml)
+- Model validation (`opus`, `sonnet`, `kimi-k2.6`, `swe` + prefix match)
+- `atexit` session cancellation, thread-safe bindings, TTL cleanup
 
 **Enabling:**
 ```yaml
 # ~/.hermes/config.yaml
 enabled_toolsets:
   - devin
-```
-Or: `hermes tools enable devin`
-
-**Config defaults:**
-```yaml
 devin:
-  model: "sonnet"   # or delegation.devin_model
+  model: "sonnet"
 ```
 
-**Fallback chain:** `opus` → `sonnet` → `kimi-k2.6` → `swe` (matches oh-my-opendevin tiers)
+**Fallback chain:** `opus` → `sonnet` → `kimi-k2.6` → `swe`
 
 ---
 

@@ -17,6 +17,9 @@ This skill enables Hermes Agent to delegate tasks to a Devin CLI agent running
 through the oh-my-opendevin repository. It provides high-level tools that wrap
 the oh-my-opendevin Devin MCP server with agent-friendly semantics.
 
+> **Full documentation:** `docs/DEVIN_INTEGRATION.md`
+> **Verification script:** `tests/tools/verify_devin_integration.py`
+
 ## When to Use
 
 Use `devin_delegate` when:
@@ -187,6 +190,26 @@ Or via CLI:
 ```bash
 hermes tools enable devin
 ```
+
+## Verification
+
+Run the comprehensive verification script to check your installation:
+
+```bash
+# Safe mode — no API quota used
+python3 tests/tools/verify_devin_integration.py
+
+# Only show failures
+python3 tests/tools/verify_devin_integration.py --quiet
+
+# Live mode — starts a real Devin session (uses API quota)
+python3 tests/tools/verify_devin_integration.py --live
+```
+
+The script verifies:
+- Auto-discovery, MCP server handshake, tool registry
+- Model validation, config defaults, session lifecycle
+- Thread safety, cleanup, subagent bridge, role normalisation
 
 ## Fallback Behavior
 
