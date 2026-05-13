@@ -922,6 +922,14 @@ class DevinSubagent:
             except Exception:
                 pass
 
+    def _stream_to_print(self, chunk: str) -> None:
+        """Forward an incremental output chunk to the parent's print function."""
+        if self._print_fn:
+            try:
+                self._print_fn(chunk)
+            except Exception:
+                pass
+
     def run_conversation(self, user_message: str, task_id: Optional[str] = None) -> dict:
         """Call devin_delegate and return an AIAgent-compatible result dict."""
         self._report_progress("Starting Devin session...")
@@ -934,6 +942,7 @@ class DevinSubagent:
             platform=self._platform,
             chat_id=self._chat_id,
             thread_id=self._thread_id,
+            stream_callback=self._stream_to_print,
         )
 
         # Parse JSON result from devin_delegate

@@ -761,3 +761,70 @@ class TestBindingTtl:
             ddg._check_pending_sessions()
         assert "sess-fresh" in ddg._session_bindings
         ddg._session_bindings.clear()
+
+
+# ---------------------------------------------------------------------------
+# New high-level tools
+# ---------------------------------------------------------------------------
+
+class TestDevinCancel:
+    """Tests for devin_cancel."""
+
+    def test_cancel_calls_mcp_and_untracks(self):
+        """devin_cancel dispatches to MCP, untracks, and unbinds."""
+        import tools.devin_delegate as ddg
+
+        ddg._active_devin_sessions.add("sess-x")
+        ddg._session_bindings["sess-x"] = {"platform": "telegram", "chat_id": "1"}
+
+        with patch.object(ddg, "_call_devin_mcp", return_value={"result": "ok"}):
+            result = json.loads(ddg.devin_cancel("sess-x"))
+
+        assert result["cancelled"] is True
+        assert "sess-x" not in ddg._active_devin_sessions
+        assert "sess-x" not in ddg._session_bindings
+
+
+class TestDevinHealth:
+    """Tests for devin_health."""
+
+    def test_health_parses_snapshot(self):
+        """devin_health returns a snapshot dict."""
+        import tools.devin_delegate as ddg
+
+        with patch.object(ddg, "_call_devin_mcp", return_value={"result": "binary: ok\ndisk: 45%"}):
+            result = json.loads(ddg.devin_health())
+
+        assert result["healthy"] is True
+        assert result["snapshot"]["binary"] == "ok"
+
+
+class TestDevinResumable:
+    """Tests for devin_resumable."""
+
+    def test_resumable_parses_sessions(self):
+        """devin_resumable returns a list of session lines."""
+        import tools.devin_delegate as ddg
+
+        fake = {"result": "- abc123  [completed]\n- def456  [error]"}
+        with patch.object(ddg, "_call_devin_mcp", return_value=fake):
+            result = json.loads(ddg.devin_resumable())
+
+        assert result["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Error tag extraction
+# ---------------------------------------------------------------------------
+
+class TestErrorTagExtraction:
+    """Tests for _extract_error_tag."""
+
+    def test_known_tags_extracted(self):
+        """Structured error tags are pulled from MCP responses."""
+        import tools.devin_delegate as ddg
+        assert ddg._extract_error_tag("RATE_LIMIT: too many requests") == "RATE_LIMIT"
+        assert ddg._extract_error_tag("QUOTA_EXCEEDED for model swe") == "QUOTA_EXCEEDED"
+        assert ddg._extract_error_tag("CONTEXT_LIMIT hit") == "CONTEXT_LIMIT"
+        assert ddg._extract_error_tag("UNKNOWN error") == "UNKNOWN"
+        assert ddg._extract_error_tag("random failure") is None

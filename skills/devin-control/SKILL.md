@@ -54,7 +54,9 @@ Start a Devin session and optionally wait for completion.
 }
 ```
 
-- `model`: One of `opus`, `sonnet`, `kimi-k2.6`, `swe`, `codex`. Defaults to `kimi-k2.6`.
+- `model`: One of `opus`, `sonnet`, `kimi-k2.6`, `swe`, `codex`. Defaults to
+  the value in `~/.hermes/config.yaml` (`devin.model` or `delegation.devin_model`),
+  falling back to `kimi-k2.6`.
 - `wait`: If `true`, blocks until the session exits (up to 2 hours). If `false`,
   returns immediately with a `session_id`.
 - `auto_fallback`: If `true`, automatically retries with the next model in the
@@ -70,6 +72,9 @@ Returns:
   "model": "sonnet"
 }
 ```
+
+On errors the response includes an `error_tag` field:
+`RATE_LIMIT`, `QUOTA_EXCEEDED`, `CONTEXT_LIMIT`, or `UNKNOWN`.
 
 ### devin_status_check
 
@@ -95,6 +100,37 @@ List all Devin sessions managed by the MCP server.
   "include_output": false
 }
 ```
+
+### devin_cancel
+
+Cancel a running Devin session and remove it from the async monitor.
+
+```json
+{
+  "session_id": "abc123"
+}
+```
+
+### devin_health
+
+Check the Devin MCP server health (binary availability, disk usage, slot usage,
+orphaned session count).
+
+```json
+{}
+```
+
+### devin_resumable
+
+List completed/errored sessions eligible for resumption.
+
+```json
+{
+  "limit": 10
+}
+```
+
+Use the returned `session_id` as the `resume` parameter in `devin_delegate`.
 
 ## Subagent Integration
 

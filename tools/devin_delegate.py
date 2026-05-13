@@ -363,6 +363,17 @@ def _poll_devin_status(
     }
 
 
+def _extract_error_tag(text: str) -> Optional[str]:
+    """Extract structured error tags from MCP server responses.
+
+    Known tags: RATE_LIMIT, QUOTA_EXCEEDED, CONTEXT_LIMIT, UNKNOWN.
+    """
+    for tag in ("RATE_LIMIT", "QUOTA_EXCEEDED", "CONTEXT_LIMIT", "UNKNOWN"):
+        if tag in text:
+            return tag
+    return None
+
+
 def devin_delegate(
     prompt: str,
     model: Optional[str] = None,
@@ -376,6 +387,7 @@ def devin_delegate(
     platform: Optional[str] = None,
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
+    stream_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     """Start a Devin session and optionally block until it completes.
 
@@ -391,6 +403,8 @@ def devin_delegate(
       platform (str, optional): Gateway platform (for bidirectional notifications).
       chat_id (str, optional): Gateway chat ID (for bidirectional notifications).
       thread_id (str, optional): Gateway thread ID (for bidirectional notifications).
+      stream_callback (callable, optional): Called with each incremental output
+        chunk during the wait loop. Useful for streaming to the parent agent UI.
 
     Returns JSON with:
       - session_id
@@ -398,6 +412,7 @@ def devin_delegate(
       - summary (the session output)
       - duration_seconds
       - model (resolved model)
+      - error_tag (RATE_LIMIT, QUOTA_EXCEEDED, CONTEXT_LIMIT, UNKNOWN)
     """
     start_time = time.monotonic()
 
@@ -437,6 +452,7 @@ def devin_delegate(
             "error": start_result["error"],
             "model": current_model,
             "attempts": attempts,
+            "error_tag": _extract_error_tag(start_result["error"]),
         }, ensure_ascii=False)
 
     session_id = start_result.get("session_id", "")
@@ -461,7 +477,7 @@ def devin_delegate(
             "duration_seconds": round(time.monotonic() - start_time, 2),
         }, ensure_ascii=False)
 
-    # Wait loop with exponential-backoff polling
+    # Wait loop with exponential-backoff polling + optional streaming
     total_wait_limit = _DEFAULT_MAX_WAIT_SECONDS
     deadline = start_time + total_wait_limit
     last_output_bytes = 0
@@ -478,6 +494,7 @@ def devin_delegate(
                     "summary": wait_result["error"],
                     "model": resolved_model,
                     "duration_seconds": round(time.monotonic() - start_time, 2),
+                    "error_tag": _extract_error_tag(wait_result["error"]),
                 }, ensure_ascii=False)
 
             if wait_result.get("exited"):
@@ -494,7 +511,15 @@ def devin_delegate(
             # Still running — poll incrementally for progress
             poll_result = _poll_devin_status(session_id, since_bytes=last_output_bytes)
             if "error" not in poll_result:
-                last_output_bytes = poll_result.get("output_bytes", last_output_bytes)
+                new_bytes = poll_result.get("output_bytes", last_output_bytes)
+                if stream_callback and new_bytes > last_output_bytes:
+                    chunk = poll_result.get("output", "")
+                    if chunk:
+                        try:
+                            stream_callback(chunk)
+                        except Exception:
+                            pass
+                last_output_bytes = new_bytes
 
             # Exponential-backoff sleep capped at _MAX_POLL_INTERVAL_SECONDS
             poll_iteration += 1
@@ -534,6 +559,83 @@ def devin_status_check(
     """
     result = _poll_devin_status(session_id, since_bytes=since_bytes)
     return json.dumps(result, ensure_ascii=False)
+
+
+def devin_cancel(session_id: str, task_id: Optional[str] = None) -> str:
+    """Cancel a running Devin session.
+
+    Parameters:
+      session_id (str): The session ID to cancel.
+
+    Returns JSON with cancellation status.
+    """
+    result = _call_devin_mcp("devin_cancel", {"session_id": session_id})
+    text = _extract_text_from_mcp_result(result)
+
+    if "error" in result:
+        return json.dumps({"error": text}, ensure_ascii=False)
+
+    _untrack_session(session_id)
+    unbind_session(session_id)
+
+    return json.dumps({
+        "session_id": session_id,
+        "cancelled": True,
+        "raw": text,
+    }, ensure_ascii=False)
+
+
+def devin_health() -> str:
+    """Check the health of the Devin MCP server.
+
+    Returns JSON with binary availability, disk usage, slot usage,
+    and orphaned session count.
+    """
+    result = _call_devin_mcp("devin_health", {})
+    text = _extract_text_from_mcp_result(result)
+
+    if "error" in result:
+        return json.dumps({"error": text}, ensure_ascii=False)
+
+    # Parse key:value health snapshot
+    snap = _parse_snapshot(text)
+    return json.dumps({
+        "healthy": "error" not in text.lower(),
+        "snapshot": snap,
+        "raw": text,
+    }, ensure_ascii=False)
+
+
+def devin_resumable(limit: Optional[int] = None, task_id: Optional[str] = None) -> str:
+    """List Devin sessions eligible for resumption.
+
+    Parameters:
+      limit (int, optional): Maximum number of sessions to return.
+
+    Returns JSON with a list of resumable sessions.
+    """
+    args: dict = {}
+    if limit is not None:
+        args["limit"] = limit
+    result = _call_devin_mcp("devin_resumable", args)
+    text = _extract_text_from_mcp_result(result)
+
+    if "error" in result:
+        return json.dumps({"error": text}, ensure_ascii=False)
+
+    sessions: List[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line == "(no sessions)":
+            continue
+        if line.startswith("- "):
+            sessions.append({"line": line})
+
+    return json.dumps({
+        "sessions": sessions,
+        "count": len(sessions),
+        "raw": text,
+    }, ensure_ascii=False)
 
 
 def devin_list_managed_sessions(
@@ -962,4 +1064,88 @@ registry.register(
     is_async=False,
     description="List active and recent Devin sessions.",
     emoji="📋",
+)
+
+registry.register(
+    name="devin_cancel",
+    toolset="devin",
+    schema={
+        "name": "devin_cancel",
+        "description": (
+            "Cancel a running Devin session. Also removes it from the "
+            "async notification monitor if it was bound."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session ID to cancel.",
+                },
+            },
+            "required": ["session_id"],
+        },
+    },
+    handler=lambda args, **kw: devin_cancel(
+        session_id=args["session_id"],
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_devin_delegate_requirements,
+    requires_env=[],
+    is_async=False,
+    description="Cancel a running Devin session.",
+    emoji="🛑",
+)
+
+registry.register(
+    name="devin_health",
+    toolset="devin",
+    schema={
+        "name": "devin_health",
+        "description": (
+            "Check Devin MCP server health: binary availability, disk usage, "
+            "slot usage, and orphaned session count."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    handler=lambda args, **kw: devin_health(),
+    check_fn=check_devin_delegate_requirements,
+    requires_env=[],
+    is_async=False,
+    description="Check Devin MCP server health.",
+    emoji="🏥",
+)
+
+registry.register(
+    name="devin_resumable",
+    toolset="devin",
+    schema={
+        "name": "devin_resumable",
+        "description": (
+            "List Devin sessions that completed or errored and are eligible "
+            "for resumption. Pass a session_id as the resume parameter to "
+            "devin_delegate to continue work."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of sessions to return.",
+                },
+            },
+        },
+    },
+    handler=lambda args, **kw: devin_resumable(
+        limit=args.get("limit"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_devin_delegate_requirements,
+    requires_env=[],
+    is_async=False,
+    description="List Devin sessions eligible for resumption.",
+    emoji="🔁",
 )

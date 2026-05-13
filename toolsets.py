@@ -233,13 +233,17 @@ TOOLSETS = {
     "devin": {
         "description": (
             "Delegate tasks to a Devin agent via oh-my-opendevin. "
-            "Start background Devin CLI sessions, poll status, and receive "
-            "completion notifications. Auto-discovers the oh-my-opendevin repo."
+            "Start background Devin CLI sessions, poll status, cancel, resume, "
+            "check health, and receive completion notifications. "
+            "Auto-discovers the oh-my-opendevin repo."
         ),
         "tools": [
             "devin_delegate",
             "devin_status_check",
             "devin_list_sessions",
+            "devin_cancel",
+            "devin_health",
+            "devin_resumable",
         ],
         "includes": [],
     },

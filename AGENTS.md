@@ -337,7 +337,8 @@ Hermes can delegate tasks to a Devin CLI agent via the oh-my-opendevin repositor
 The integration is layered:
 
 **1. MCP server auto-discovery** (`tools/devin_discovery.py`)
-- Searches for `oh-my-opendevin` in common paths (`~/Code/`, `~/repos/`, etc.)
+- Searches for `oh-my-opendevin` in 18 common paths (`~/Code/`, `~/repos/`,
+  `~/dev/`, `~/github/`, `~/tools/`, `~/opt/`, etc.)
 - Honors `OH_MY_OPENDEVIN_PATH` environment variable
 - Validates the repo has `src/mcp-servers/devin/index.ts` and `bin/devin-mcp-launcher.sh`
 - Checks `bun` is on PATH
@@ -345,23 +346,37 @@ The integration is layered:
 
 **2. High-level tools** (`tools/devin_delegate.py`)
 - `devin_delegate` — start a Devin session, optionally wait for completion,
-  with automatic model fallback on quota errors
+  with automatic model fallback on quota errors, incremental output streaming,
+  and structured error tags (`RATE_LIMIT`, `QUOTA_EXCEEDED`, `CONTEXT_LIMIT`)
 - `devin_status_check` — incremental polling with `since_bytes`
 - `devin_list_sessions` — list managed sessions
+- `devin_cancel` — cancel a running session and remove from monitor
+- `devin_health` — check MCP server health (binary, disk, slots, orphans)
+- `devin_resumable` — list sessions eligible for resumption
 - Registered under the `devin` toolset in `toolsets.py`
 
 **3. Subagent bridge** (`tools/delegate_tool.py`)
 - `role="devin"` in `delegate_task` routes to `DevinSubagent` instead of `AIAgent`
 - `DevinSubagent` implements the minimal surface `_run_single_child` expects:
   `run_conversation()`, `interrupt()`, `close()`, `get_activity_summary()`
-- Progress callbacks, heartbeat, and timeout handling work transparently
+- Progress callbacks, heartbeat, timeout handling, and incremental output
+  streaming via `_print_fn` work transparently
 
 **4. Bidirectional notifications** (`tools/devin_delegate.py` monitor thread)
 - A daemon thread (`devin-monitor`) polls active Devin sessions every 30s
 - On completion, looks up the session's platform/chat_id binding
 - Sends a completion message via the gateway runner's platform adapter
   (`asyncio.run_coroutine_threadsafe(adapter.send(...), runner._gateway_loop)`)
-- Falls back to logging if the gateway is not running
+- Falls back to a registered callback, then logging if the gateway is unavailable
+- Auto-purges bindings older than 24h to prevent unbounded memory growth
+
+**5. Production hardening**
+- Exponential-backoff polling (base 2s → max 60s) reduces MCP server load
+- Config-driven default model via `delegation.devin_model` or `devin.model`
+  in `~/.hermes/config.yaml` (5s cache)
+- Model validation accepts known tiers (`opus`, `sonnet`, `kimi-k2.6`, `swe`)
+  and fully-qualified IDs by prefix (e.g. `swe-1-6`)
+- `atexit` handler cancels all Devin sessions started by this process on exit
 
 **Enabling:**
 ```yaml
@@ -370,6 +385,12 @@ enabled_toolsets:
   - devin
 ```
 Or: `hermes tools enable devin`
+
+**Config defaults:**
+```yaml
+devin:
+  model: "sonnet"   # or delegation.devin_model
+```
 
 **Fallback chain:** `opus` → `sonnet` → `kimi-k2.6` → `swe` (matches oh-my-opendevin tiers)
 
