@@ -1,0 +1,740 @@
+"""High-level Devin delegation tools.
+
+Wraps the raw MCP tools exposed by the oh-my-opendevin Devin MCP server into
+agent-friendly operations with:
+  - Automatic session lifecycle management (start -> wait -> result)
+  - Model fallback on quota exhaustion
+  - Incremental output polling
+  - Clean result parsing
+
+These tools assume the oh-my-opendevin Devin MCP server is already connected
+(via auto-discovery in tools/mcp_tool.py or manual config).
+"""
+
+import json
+import logging
+import re
+import threading
+import time
+from typing import Dict, List, Optional
+
+from tools.registry import registry
+
+logger = logging.getLogger(__name__)
+
+# Devin model fallback chain (same as oh-my-opendevin tiers.ts)
+_DEVIN_FALLBACK_CHAIN = ["opus", "sonnet", "kimi-k2.6", "swe"]
+
+# Max total wait time for devin_delegate (2 hours default)
+_DEFAULT_MAX_WAIT_SECONDS = 7200
+# Poll interval when devin_wait times out
+_POLL_INTERVAL_SECONDS = 5
+
+
+def _find_devin_mcp_tool(base_name: str) -> Optional[str]:
+    """Find the registered MCP tool name for a Devin tool (e.g. 'devin_start').
+
+    Searches the registry for any MCP-registered tool whose name ends with
+    the base name (e.g. ``mcp_opendevin_devin_devin_start``).
+    """
+    for entry_name in registry.get_all_tool_names():
+        if entry_name.endswith(f"_{base_name}"):
+            entry = registry.get_entry(entry_name)
+            if entry and entry.toolset.startswith("mcp-"):
+                return entry_name
+    return None
+
+
+def _devin_mcp_available() -> bool:
+    """Return True when at least the core Devin MCP tools are registered."""
+    return _find_devin_mcp_tool("devin_start") is not None
+
+
+def _call_devin_mcp(tool_base_name: str, args: dict) -> dict:
+    """Call a Devin MCP tool and return the result as a parsed dict.
+
+    The raw MCP response is a JSON string with either:
+      {"result": "<text from MCP server>"}
+      {"error": "<error message>"}
+    """
+    tool_name = _find_devin_mcp_tool(tool_base_name)
+    if not tool_name:
+        return {"error": f"Devin MCP tool '{tool_base_name}' not found. "
+                          f"Is the oh-my-opendevin MCP server connected?"}
+
+    raw = registry.dispatch(tool_name, args)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Some tools return plain text wrapped in a result string
+        parsed = {"result": raw}
+    return parsed
+
+
+def _extract_text_from_mcp_result(result: dict) -> str:
+    """Extract the text payload from an MCP result dict."""
+    if "error" in result:
+        return result["error"]
+    if "result" in result:
+        return str(result["result"])
+    return str(result)
+
+
+def _parse_snapshot(text: str) -> Dict[str, str]:
+    """Parse the key:value lines from a Devin snapshot text block."""
+    out: Dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Handle "status: running (exit 0)" -> key=status, value=running (exit 0)
+        if ":" in line:
+            key, _, val = line.partition(":")
+            out[key.strip()] = val.strip()
+    return out
+
+
+def _parse_output_from_snapshot(text: str) -> str:
+    """Extract the output section after '--- output (tail) ---' or '--- new output ---'."""
+    for marker in ("--- new output ---", "--- output (tail) ---"):
+        idx = text.find(marker)
+        if idx != -1:
+            return text[idx + len(marker):].lstrip("\n")
+    return text
+
+
+def _get_next_fallback_model(current: str) -> Optional[str]:
+    """Return the next model in the Devin fallback chain."""
+    try:
+        idx = _DEVIN_FALLBACK_CHAIN.index(current)
+    except ValueError:
+        # If current is not in chain, start from the beginning
+        return _DEVIN_FALLBACK_CHAIN[0] if _DEVIN_FALLBACK_CHAIN else None
+    if idx + 1 < len(_DEVIN_FALLBACK_CHAIN):
+        return _DEVIN_FALLBACK_CHAIN[idx + 1]
+    return None
+
+
+def _start_devin_session(
+    prompt: str,
+    model: Optional[str] = None,
+    cwd: Optional[str] = None,
+    permission_mode: Optional[str] = None,
+    resume: Optional[str] = None,
+    max_duration_ms: Optional[int] = None,
+    auto_fallback: bool = True,
+) -> dict:
+    """Start a Devin session, with optional manual fallback on quota errors."""
+    args: dict = {"prompt": prompt}
+    if model:
+        args["model"] = model
+    if cwd:
+        args["cwd"] = cwd
+    if permission_mode:
+        args["permission_mode"] = permission_mode
+    if resume:
+        args["resume"] = resume
+    if max_duration_ms is not None:
+        args["max_duration_ms"] = max_duration_ms
+    args["auto_fallback"] = auto_fallback
+
+    result = _call_devin_mcp("devin_start", args)
+    text = _extract_text_from_mcp_result(result)
+
+    # Check for quota errors even when auto_fallback was passed
+    # (older MCP servers might not support it)
+    if "QUOTA_EXCEEDED" in text and not auto_fallback:
+        return {"error": text, "quota_exceeded": True, "model": model}
+
+    if "error" in result or "FAILED" in text:
+        # Check if it's a quota error that we should retry manually
+        if "QUOTA_EXCEEDED" in text or "quota exceeded" in text.lower():
+            return {"error": text, "quota_exceeded": True, "model": model}
+        return {"error": text}
+
+    # Parse session_id from the response text
+    snap = _parse_snapshot(text)
+    session_id = snap.get("session_id", "")
+
+    return {
+        "session_id": session_id,
+        "snapshot": snap,
+        "raw": text,
+    }
+
+
+def _wait_devin_session(
+    session_id: str,
+    timeout_ms: int = 30000,
+    tail_bytes: int = 8192,
+) -> dict:
+    """Call devin_wait and parse the result."""
+    result = _call_devin_mcp("devin_wait", {
+        "session_id": session_id,
+        "timeout_ms": timeout_ms,
+        "tail_bytes": tail_bytes,
+    })
+    text = _extract_text_from_mcp_result(result)
+
+    if "error" in result:
+        return {"error": text}
+
+    snap = _parse_snapshot(text)
+    status = snap.get("status", "").lower()
+
+    # "Session {id} exited." means it finished
+    exited = "exited" in text.lower() or status in ("completed", "error", "cancelled")
+
+    return {
+        "exited": exited,
+        "status": status,
+        "snapshot": snap,
+        "output": _parse_output_from_snapshot(text),
+        "raw": text,
+    }
+
+
+def _poll_devin_status(
+    session_id: str,
+    since_bytes: int = 0,
+) -> dict:
+    """Call devin_status with since_bytes and parse the result."""
+    result = _call_devin_mcp("devin_status", {
+        "session_id": session_id,
+        "since_bytes": since_bytes,
+    })
+    text = _extract_text_from_mcp_result(result)
+
+    if "error" in result:
+        return {"error": text}
+
+    snap = _parse_snapshot(text)
+    status = snap.get("status", "").lower()
+
+    # Extract output_bytes for next poll
+    output_bytes_str = snap.get("output_bytes", "0")
+    try:
+        output_bytes = int(output_bytes_str)
+    except (ValueError, TypeError):
+        output_bytes = since_bytes
+
+    return {
+        "status": status,
+        "snapshot": snap,
+        "output": _parse_output_from_snapshot(text),
+        "output_bytes": output_bytes,
+        "raw": text,
+    }
+
+
+def devin_delegate(
+    prompt: str,
+    model: Optional[str] = None,
+    cwd: Optional[str] = None,
+    permission_mode: Optional[str] = None,
+    resume: Optional[str] = None,
+    max_duration_ms: Optional[int] = None,
+    wait: bool = True,
+    auto_fallback: bool = True,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> str:
+    """Start a Devin session and optionally block until it completes.
+
+    Parameters:
+      prompt (str): The task prompt for Devin.
+      model (str, optional): Devin model keyword (e.g. "opus", "sonnet", "kimi-k2.6", "swe").
+      cwd (str, optional): Working directory for the session.
+      permission_mode (str, optional): "auto" or "dangerous".
+      resume (str, optional): Resume a previous session by ID.
+      max_duration_ms (int, optional): Max duration before auto-cancel (default 2h).
+      wait (bool): If True, block until the session exits or max wait time.
+      auto_fallback (bool): If True, retry with next model on quota errors.
+      platform (str, optional): Gateway platform (for bidirectional notifications).
+      chat_id (str, optional): Gateway chat ID (for bidirectional notifications).
+      thread_id (str, optional): Gateway thread ID (for bidirectional notifications).
+
+    Returns JSON with:
+      - session_id
+      - status (completed / error / cancelled / running / etc.)
+      - summary (the session output)
+      - duration_seconds
+      - model (resolved model)
+    """
+    start_time = time.monotonic()
+
+    # Try starting with the requested model, fallback on quota error
+    current_model = model
+    attempts = 0
+    max_attempts = len(_DEVIN_FALLBACK_CHAIN) + 1
+
+    while attempts < max_attempts:
+        attempts += 1
+        start_result = _start_devin_session(
+            prompt=prompt,
+            model=current_model,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            resume=resume,
+            max_duration_ms=max_duration_ms,
+            auto_fallback=auto_fallback,
+        )
+
+        if "error" not in start_result:
+            break  # Success
+
+        # If quota exceeded and we can fallback, retry
+        if start_result.get("quota_exceeded") and auto_fallback:
+            next_model = _get_next_fallback_model(current_model or "")
+            if next_model:
+                logger.warning(
+                    "Devin model %s quota exceeded, falling back to %s (attempt %d/%d)",
+                    current_model, next_model, attempts, max_attempts,
+                )
+                current_model = next_model
+                continue
+
+        # Non-quota error or out of fallback options
+        return json.dumps({
+            "error": start_result["error"],
+            "model": current_model,
+            "attempts": attempts,
+        }, ensure_ascii=False)
+
+    session_id = start_result.get("session_id", "")
+    if not session_id:
+        return json.dumps({
+            "error": "Devin session started but no session_id was returned.",
+            "raw": start_result.get("raw", ""),
+        }, ensure_ascii=False)
+
+    resolved_model = start_result.get("snapshot", {}).get("model", current_model or "kimi-k2.6")
+
+    if not wait:
+        # Fire-and-forget: bind for async completion notification
+        _bind_session_to_conversation(
+            session_id, task_id=task_id, platform=platform, chat_id=chat_id, thread_id=thread_id
+        )
+        return json.dumps({
+            "session_id": session_id,
+            "status": "running",
+            "summary": f"Devin session {session_id} started (model: {resolved_model}).",
+            "model": resolved_model,
+            "duration_seconds": round(time.monotonic() - start_time, 2),
+        }, ensure_ascii=False)
+
+    # Wait loop
+    total_wait_limit = _DEFAULT_MAX_WAIT_SECONDS
+    deadline = start_time + total_wait_limit
+    last_output_bytes = 0
+
+    while time.monotonic() < deadline:
+        wait_result = _wait_devin_session(session_id, timeout_ms=30000)
+
+        if "error" in wait_result:
+            return json.dumps({
+                "session_id": session_id,
+                "status": "error",
+                "summary": wait_result["error"],
+                "model": resolved_model,
+                "duration_seconds": round(time.monotonic() - start_time, 2),
+            }, ensure_ascii=False)
+
+        if wait_result.get("exited"):
+            status = wait_result.get("status", "unknown")
+            output = wait_result.get("output", "")
+            return json.dumps({
+                "session_id": session_id,
+                "status": status,
+                "summary": output,
+                "model": resolved_model,
+                "duration_seconds": round(time.monotonic() - start_time, 2),
+            }, ensure_ascii=False)
+
+        # Still running — poll incrementally for progress
+        poll_result = _poll_devin_status(session_id, since_bytes=last_output_bytes)
+        if "error" not in poll_result:
+            last_output_bytes = poll_result.get("output_bytes", last_output_bytes)
+
+        # Short sleep before next wait attempt
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
+
+    # Max wait exceeded
+    return json.dumps({
+        "session_id": session_id,
+        "status": "timeout",
+        "summary": f"Devin session {session_id} did not complete within {total_wait_limit}s.",
+        "model": resolved_model,
+        "duration_seconds": round(time.monotonic() - start_time, 2),
+    }, ensure_ascii=False)
+
+
+def devin_status_check(
+    session_id: str,
+    since_bytes: int = 0,
+    task_id: Optional[str] = None,
+) -> str:
+    """Check the status of a running Devin session.
+
+    Parameters:
+      session_id (str): The session ID returned by devin_delegate.
+      since_bytes (int): Return only new output after this byte offset.
+                         Use 0 for full snapshot. Use output_bytes from the
+                         previous call for incremental reads.
+
+    Returns JSON with status, output, and output_bytes for the next poll.
+    """
+    result = _poll_devin_status(session_id, since_bytes=since_bytes)
+    return json.dumps(result, ensure_ascii=False)
+
+
+def devin_list_managed_sessions(
+    filter_status: Optional[str] = None,
+    include_output: bool = False,
+    task_id: Optional[str] = None,
+) -> str:
+    """List Devin sessions managed by the MCP server.
+
+    Parameters:
+      filter_status (str, optional): Filter by status (running, completed, error, etc.)
+      include_output (bool): Include a tail of each session's output.
+
+    Returns JSON with a list of sessions.
+    """
+    result = _call_devin_mcp("devin_list", {"include_output": include_output})
+    text = _extract_text_from_mcp_result(result)
+
+    if "error" in result:
+        return json.dumps({"error": text}, ensure_ascii=False)
+
+    # Parse the text list into structured entries
+    sessions: List[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line == "(no sessions)":
+            continue
+        # Format: "- {id}  [{status}]  model={model}  duration={dur}ms  prompt={prompt}"
+        if line.startswith("- "):
+            sessions.append({"line": line})
+        elif line.startswith("  tail: "):
+            if sessions:
+                sessions[-1]["tail"] = line[7:]
+
+    if filter_status:
+        sessions = [s for s in sessions if filter_status.lower() in s.get("line", "").lower()]
+
+    return json.dumps({
+        "sessions": sessions,
+        "count": len(sessions),
+        "raw": text,
+    }, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Conversation binding for bidirectional notifications
+# ---------------------------------------------------------------------------
+
+# Module-level registry: session_id -> conversation metadata dict.
+# Populated by devin_delegate and consumed by the gateway monitor.
+_session_bindings: Dict[str, dict] = {}
+
+
+def _bind_session_to_conversation(
+    session_id: str,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> None:
+    """Store a mapping from Devin session to Hermes conversation context.
+
+    The gateway monitor uses this to route completion notifications back
+    to the originating conversation.
+    """
+    if not session_id:
+        return
+    _session_bindings[session_id] = {
+        "task_id": task_id,
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "bound_at": time.time(),
+    }
+    _ensure_monitor()
+
+
+def get_session_bindings() -> Dict[str, dict]:
+    """Return a snapshot of active session->conversation bindings."""
+    return dict(_session_bindings)
+
+
+def unbind_session(session_id: str) -> None:
+    """Remove a session binding (called after notification is sent)."""
+    _session_bindings.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Background monitor for async Devin session completion notifications
+# ---------------------------------------------------------------------------
+
+_monitor_thread: Optional[threading.Thread] = None
+_monitor_lock = threading.Lock()
+_MONITOR_INTERVAL_SECONDS = 30
+
+
+def _ensure_monitor() -> None:
+    """Start the background Devin session monitor if not already running."""
+    global _monitor_thread
+    with _monitor_lock:
+        if _monitor_thread is not None and _monitor_thread.is_alive():
+            return
+        _monitor_thread = threading.Thread(
+            target=_devin_monitor_loop, daemon=True, name="devin-monitor"
+        )
+        _monitor_thread.start()
+        logger.info("Started Devin session monitor thread")
+
+
+def _devin_monitor_loop() -> None:
+    """Daemon thread that polls active Devin sessions and notifies on completion."""
+    while True:
+        time.sleep(_MONITOR_INTERVAL_SECONDS)
+        try:
+            _check_pending_sessions()
+        except Exception as exc:
+            logger.debug("Devin monitor cycle error: %s", exc)
+
+
+def _check_pending_sessions() -> None:
+    """Poll all bound Devin sessions; notify and unbind those that have completed."""
+    bindings = get_session_bindings()
+    if not bindings:
+        return
+    for session_id, meta in list(bindings.items()):
+        try:
+            result = _poll_devin_status(session_id, since_bytes=0)
+        except Exception as exc:
+            logger.debug("Devin monitor poll error for %s: %s", session_id, exc)
+            continue
+
+        status = result.get("status", "").lower()
+        if status in ("completed", "error", "cancelled"):
+            _notify_completion(session_id, meta, result)
+            unbind_session(session_id)
+
+
+def _notify_completion(session_id: str, meta: dict, result: dict) -> None:
+    """Send a completion notification for a Devin session.
+
+    Tries the gateway runner first (for messaging platforms), falls back to
+    logging.  Fire-and-forget: exceptions are swallowed so the monitor stays
+    healthy.
+    """
+    platform = meta.get("platform")
+    chat_id = meta.get("chat_id")
+    thread_id = meta.get("thread_id")
+
+    status = result.get("status", "unknown")
+    summary = result.get("output", "")[:800]
+    icon = "✅" if status == "completed" else "❌"
+    message = (
+        f"{icon} **Devin session** `{session_id}` **finished** (status: {status})\n\n"
+        f"{summary}"
+    )
+
+    if not platform or not chat_id:
+        logger.info("Devin session %s completed (no platform/chat_id for push)", session_id)
+        return
+
+    # Try gateway runner notification
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner and hasattr(runner, "adapters"):
+            adapter = runner.adapters.get(platform)
+            if adapter and hasattr(runner, "_gateway_loop"):
+                loop = runner._gateway_loop
+                if loop and not loop.is_closed():
+                    import asyncio
+                    metadata = {"thread_id": thread_id} if thread_id else None
+                    asyncio.run_coroutine_threadsafe(
+                        adapter.send(chat_id, message, metadata=metadata),
+                        loop,
+                    )
+                    logger.info("Notified %s/%s about Devin session %s completion", platform, chat_id, session_id)
+                    return
+    except Exception as exc:
+        logger.debug("Gateway notification failed for %s: %s", session_id, exc)
+
+    logger.info("Devin session %s completed on %s/%s (notification not sent: no adapter/loop)",
+                session_id, platform, chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Tool registration
+# ---------------------------------------------------------------------------
+
+
+def check_devin_delegate_requirements() -> bool:
+    """Available when the Devin MCP server is connected."""
+    return _devin_mcp_available()
+
+
+registry.register(
+    name="devin_delegate",
+    toolset="devin",
+    schema={
+        "name": "devin_delegate",
+        "description": (
+            "Delegate a task to a Devin agent running via oh-my-opendevin. "
+            "Starts a background Devin CLI session with the given prompt, "
+            "optionally waits for completion, and returns the result. "
+            "Supports automatic model fallback on quota exhaustion.\n\n"
+            "Use this for: long-running tasks (>5 min), complex multi-file "
+            "refactors, tasks requiring Devin's reliability pack, or when "
+            "you want to offload work to a separate agent instance.\n\n"
+            "When wait=false, the session_id is returned for later polling "
+            "with devin_status_check."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The task prompt to send to Devin.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Devin model keyword: 'opus', 'sonnet', 'kimi-k2.6', 'swe', "
+                        "'codex'. Defaults to kimi-k2.6."
+                    ),
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the Devin session.",
+                },
+                "permission_mode": {
+                    "type": "string",
+                    "enum": ["auto", "dangerous"],
+                    "description": "Devin permission mode. Default: dangerous (auto-approves).",
+                },
+                "resume": {
+                    "type": "string",
+                    "description": "Resume a previous Devin session by ID.",
+                },
+                "max_duration_ms": {
+                    "type": "integer",
+                    "description": "Max session duration in ms before auto-cancel. Default: 2h.",
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "If true, block until the session completes. Default: true.",
+                },
+                "auto_fallback": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, automatically retry with the next model in the fallback chain "
+                        "on quota errors. Default: true."
+                    ),
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
+    handler=lambda args, **kw: devin_delegate(
+        prompt=args["prompt"],
+        model=args.get("model"),
+        cwd=args.get("cwd"),
+        permission_mode=args.get("permission_mode"),
+        resume=args.get("resume"),
+        max_duration_ms=args.get("max_duration_ms"),
+        wait=args.get("wait", True),
+        auto_fallback=args.get("auto_fallback", True),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_devin_delegate_requirements,
+    requires_env=[],
+    is_async=False,
+    description="Delegate a task to Devin and optionally wait for the result.",
+    emoji="🤖",
+)
+
+registry.register(
+    name="devin_status_check",
+    toolset="devin",
+    schema={
+        "name": "devin_status_check",
+        "description": (
+            "Check the status and incremental output of a Devin session. "
+            "After the first call, always pass since_bytes (from the previous "
+            "output_bytes field) to avoid redundant data transfer."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session ID returned by devin_delegate.",
+                },
+                "since_bytes": {
+                    "type": "integer",
+                    "description": (
+                        "Return only new output after this byte offset. "
+                        "Use the output_bytes value from the previous devin_status_check response."
+                    ),
+                    "default": 0,
+                },
+            },
+            "required": ["session_id"],
+        },
+    },
+    handler=lambda args, **kw: devin_status_check(
+        session_id=args["session_id"],
+        since_bytes=args.get("since_bytes", 0),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_devin_delegate_requirements,
+    requires_env=[],
+    is_async=False,
+    description="Poll a Devin session for status and incremental output.",
+    emoji="📊",
+)
+
+registry.register(
+    name="devin_list_sessions",
+    toolset="devin",
+    schema={
+        "name": "devin_list_sessions",
+        "description": "List all Devin sessions managed by the MCP server.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filter_status": {
+                    "type": "string",
+                    "description": "Optional status filter (running, completed, error, etc.)",
+                },
+                "include_output": {
+                    "type": "boolean",
+                    "description": "Include a tail of each session's output.",
+                    "default": False,
+                },
+            },
+        },
+    },
+    handler=lambda args, **kw: devin_list_managed_sessions(
+        filter_status=args.get("filter_status"),
+        include_output=args.get("include_output", False),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_devin_delegate_requirements,
+    requires_env=[],
+    is_async=False,
+    description="List active and recent Devin sessions.",
+    emoji="📋",
+)

@@ -331,6 +331,50 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 
 ---
 
+## Devin Integration (oh-my-opendevin)
+
+Hermes can delegate tasks to a Devin CLI agent via the oh-my-opendevin repository.
+The integration is layered:
+
+**1. MCP server auto-discovery** (`tools/devin_discovery.py`)
+- Searches for `oh-my-opendevin` in common paths (`~/Code/`, `~/repos/`, etc.)
+- Honors `OH_MY_OPENDEVIN_PATH` environment variable
+- Validates the repo has `src/mcp-servers/devin/index.ts` and `bin/devin-mcp-launcher.sh`
+- Checks `bun` is on PATH
+- Injects the MCP server config into `discover_mcp_tools()` in `tools/mcp_tool.py`
+
+**2. High-level tools** (`tools/devin_delegate.py`)
+- `devin_delegate` — start a Devin session, optionally wait for completion,
+  with automatic model fallback on quota errors
+- `devin_status_check` — incremental polling with `since_bytes`
+- `devin_list_sessions` — list managed sessions
+- Registered under the `devin` toolset in `toolsets.py`
+
+**3. Subagent bridge** (`tools/delegate_tool.py`)
+- `role="devin"` in `delegate_task` routes to `DevinSubagent` instead of `AIAgent`
+- `DevinSubagent` implements the minimal surface `_run_single_child` expects:
+  `run_conversation()`, `interrupt()`, `close()`, `get_activity_summary()`
+- Progress callbacks, heartbeat, and timeout handling work transparently
+
+**4. Bidirectional notifications** (`tools/devin_delegate.py` monitor thread)
+- A daemon thread (`devin-monitor`) polls active Devin sessions every 30s
+- On completion, looks up the session's platform/chat_id binding
+- Sends a completion message via the gateway runner's platform adapter
+  (`asyncio.run_coroutine_threadsafe(adapter.send(...), runner._gateway_loop)`)
+- Falls back to logging if the gateway is not running
+
+**Enabling:**
+```yaml
+# ~/.hermes/config.yaml
+enabled_toolsets:
+  - devin
+```
+Or: `hermes tools enable devin`
+
+**Fallback chain:** `opus` → `sonnet` → `kimi-k2.6` → `swe` (matches oh-my-opendevin tiers)
+
+---
+
 ## Adding Configuration
 
 ### config.yaml options:

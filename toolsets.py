@@ -230,6 +230,20 @@ TOOLSETS = {
         "includes": []
     },
 
+    "devin": {
+        "description": (
+            "Delegate tasks to a Devin agent via oh-my-opendevin. "
+            "Start background Devin CLI sessions, poll status, and receive "
+            "completion notifications. Auto-discovers the oh-my-opendevin repo."
+        ),
+        "tools": [
+            "devin_delegate",
+            "devin_status_check",
+            "devin_list_sessions",
+        ],
+        "includes": [],
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
