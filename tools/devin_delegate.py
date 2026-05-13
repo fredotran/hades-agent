@@ -16,7 +16,7 @@ import logging
 import re
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from tools.registry import registry
 
@@ -442,6 +442,7 @@ def devin_list_managed_sessions(
 # Module-level registry: session_id -> conversation metadata dict.
 # Populated by devin_delegate and consumed by the gateway monitor.
 _session_bindings: Dict[str, dict] = {}
+_bindings_lock = threading.Lock()
 
 
 def _bind_session_to_conversation(
@@ -458,24 +459,27 @@ def _bind_session_to_conversation(
     """
     if not session_id:
         return
-    _session_bindings[session_id] = {
-        "task_id": task_id,
-        "platform": platform,
-        "chat_id": chat_id,
-        "thread_id": thread_id,
-        "bound_at": time.time(),
-    }
+    with _bindings_lock:
+        _session_bindings[session_id] = {
+            "task_id": task_id,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "bound_at": time.time(),
+        }
     _ensure_monitor()
 
 
 def get_session_bindings() -> Dict[str, dict]:
     """Return a snapshot of active session->conversation bindings."""
-    return dict(_session_bindings)
+    with _bindings_lock:
+        return dict(_session_bindings)
 
 
 def unbind_session(session_id: str) -> None:
     """Remove a session binding (called after notification is sent)."""
-    _session_bindings.pop(session_id, None)
+    with _bindings_lock:
+        _session_bindings.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -528,12 +532,56 @@ def _check_pending_sessions() -> None:
             unbind_session(session_id)
 
 
+# Optional fallback callback for notifications when the gateway is unavailable.
+# Signature: callback(session_id: str, meta: dict, result: dict) -> None
+_notification_fallback: Optional[Callable[[str, dict, dict], Any]] = None
+
+
+def register_notification_fallback(cb: Callable[[str, dict, dict], Any]) -> None:
+    """Register a callback to receive Devin completion notifications.
+
+    Called when the gateway runner is unavailable. Useful for plugins or
+    custom notification sinks (e.g. webhook, Slack bot, etc.).
+    """
+    global _notification_fallback
+    _notification_fallback = cb
+
+
+def _get_gateway_adapter(platform: str):
+    """Look up the gateway runner and return the adapter for *platform*.
+
+    Returns (adapter, event_loop) or (None, None) on any failure.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        return None, None
+
+    if runner is None:
+        return None, None
+    if not hasattr(runner, "adapters"):
+        return None, None
+
+    adapter = runner.adapters.get(platform)
+    if adapter is None:
+        return None, None
+    if not hasattr(runner, "_gateway_loop"):
+        return None, None
+
+    loop = runner._gateway_loop
+    if loop is None or loop.is_closed():
+        return None, None
+
+    return adapter, loop
+
+
 def _notify_completion(session_id: str, meta: dict, result: dict) -> None:
     """Send a completion notification for a Devin session.
 
-    Tries the gateway runner first (for messaging platforms), falls back to
-    logging.  Fire-and-forget: exceptions are swallowed so the monitor stays
-    healthy.
+    Tries the gateway runner first (for messaging platforms), then a
+    registered fallback callback, then falls back to logging.
+    Fire-and-forget: exceptions are swallowed so the monitor stays healthy.
     """
     platform = meta.get("platform")
     chat_id = meta.get("chat_id")
@@ -551,28 +599,43 @@ def _notify_completion(session_id: str, meta: dict, result: dict) -> None:
         logger.info("Devin session %s completed (no platform/chat_id for push)", session_id)
         return
 
-    # Try gateway runner notification
-    try:
-        from gateway.run import _gateway_runner_ref
-        runner = _gateway_runner_ref()
-        if runner and hasattr(runner, "adapters"):
-            adapter = runner.adapters.get(platform)
-            if adapter and hasattr(runner, "_gateway_loop"):
-                loop = runner._gateway_loop
-                if loop and not loop.is_closed():
-                    import asyncio
-                    metadata = {"thread_id": thread_id} if thread_id else None
-                    asyncio.run_coroutine_threadsafe(
-                        adapter.send(chat_id, message, metadata=metadata),
-                        loop,
-                    )
-                    logger.info("Notified %s/%s about Devin session %s completion", platform, chat_id, session_id)
-                    return
-    except Exception as exc:
-        logger.debug("Gateway notification failed for %s: %s", session_id, exc)
+    # 1. Try gateway runner notification
+    adapter, loop = _get_gateway_adapter(platform)
+    if adapter and loop:
+        try:
+            import asyncio
+            metadata = {"thread_id": thread_id} if thread_id else None
+            asyncio.run_coroutine_threadsafe(
+                adapter.send(chat_id, message, metadata=metadata),
+                loop,
+            )
+            logger.info(
+                "Notified %s/%s about Devin session %s completion",
+                platform, chat_id, session_id,
+            )
+            return
+        except Exception as exc:
+            logger.debug("Gateway adapter.send failed for %s: %s", session_id, exc)
+    else:
+        logger.debug(
+            "Gateway not available for %s/%s (Devin session %s)",
+            platform, chat_id, session_id,
+        )
 
-    logger.info("Devin session %s completed on %s/%s (notification not sent: no adapter/loop)",
-                session_id, platform, chat_id)
+    # 2. Try registered fallback callback
+    if _notification_fallback is not None:
+        try:
+            _notification_fallback(session_id, meta, result)
+            logger.info("Devin session %s completion handled by fallback callback", session_id)
+            return
+        except Exception as exc:
+            logger.debug("Notification fallback failed for %s: %s", session_id, exc)
+
+    # 3. Log-only fallback
+    logger.info(
+        "Devin session %s completed on %s/%s (notification not sent: no adapter/loop)",
+        session_id, platform, chat_id,
+    )
 
 
 # ---------------------------------------------------------------------------

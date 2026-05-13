@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -913,16 +914,30 @@ class DevinSubagent:
             chat_id=self._chat_id,
             thread_id=self._thread_id,
         )
+
+        # Parse JSON result from devin_delegate
+        result: dict = {}
+        parse_error = None
         try:
             result = json.loads(result_str)
-        except json.JSONDecodeError:
-            result = {"summary": result_str, "status": "unknown"}
+        except json.JSONDecodeError as exc:
+            parse_error = str(exc)
+            # Attempt to extract session_id with a regex heuristic
+            m = re.search(r'"session_id"\s*:\s*"([^"]+)"', result_str)
+            if m:
+                result["session_id"] = m.group(1)
+            result["summary"] = result_str
+            result["status"] = "unknown"
+            result["error"] = f"JSON parse error: {parse_error}"
 
         self._devin_session_id = result.get("session_id")
 
         status = result.get("status", "unknown")
-        summary = result.get("summary", "")
+        summary = result.get("summary", result_str)
+        # Prefer explicit error field, but also surface parse errors
         error = result.get("error", "")
+        if parse_error and not error:
+            error = f"JSON parse error: {parse_error}"
 
         return {
             "final_response": summary,

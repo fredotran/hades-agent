@@ -31,6 +31,18 @@ _SEARCH_PATHS = [
     "~/src/oh-my-opendevin",
     "~/projects/oh-my-opendevin",
     "~/workspace/oh-my-opendevin",
+    "~/dev/oh-my-opendevin",
+    "~/Development/oh-my-opendevin",
+    "~/devin/oh-my-opendevin",
+    "~/work/oh-my-opendevin",
+    "~/Documents/oh-my-opendevin",
+    "~/Dropbox/oh-my-opendevin",
+    "~/github/oh-my-opendevin",
+    "~/git/oh-my-opendevin",
+    "~/gitlab/oh-my-opendevin",
+    "~/bitbucket/oh-my-opendevin",
+    "~/tools/oh-my-opendevin",
+    "~/opt/oh-my-opendevin",
 ]
 
 # Marker files that prove a checkout has the Devin MCP server

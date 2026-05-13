@@ -554,3 +554,88 @@ class TestNormalizeRole:
         from tools.delegate_tool import _normalize_role
 
         assert _normalize_role("unknown") == "leaf"
+
+
+# ---------------------------------------------------------------------------
+# Live MCP smoke test (skipped when server unavailable)
+# ---------------------------------------------------------------------------
+
+class TestLiveMcpSmoke:
+    """Smoke tests that require a real oh-my-opendevin checkout + bun."""
+
+    @pytest.fixture(scope="class")
+    def live_mcp_config(self):
+        """Yield the MCP config only if the server is actually reachable."""
+        import shutil
+        import tools.devin_discovery as dd
+        dd._discovered_repo = None
+
+        # Fast-fail: bun missing
+        if shutil.which("bun") is None:
+            pytest.skip("bun not on PATH — oh-my-opendevin MCP server unavailable")
+
+        cfg = dd.get_devin_mcp_config()
+        if cfg is None:
+            pytest.skip("oh-my-opendevin repo not found — MCP server unavailable")
+        return cfg
+
+    def test_discovery_produces_valid_config(self, live_mcp_config):
+        """Auto-discovery returns a well-formed MCP server entry."""
+        assert "opendevin_devin" in live_mcp_config
+        entry = live_mcp_config["opendevin_devin"]
+        assert entry["command"] == "bash"
+        assert entry["args"]
+        assert Path(entry["args"][0]).exists()
+
+    def test_launcher_script_is_executable(self, live_mcp_config):
+        """The discovered launcher script exists and is executable."""
+        launcher = Path(live_mcp_config["opendevin_devin"]["args"][0])
+        assert launcher.exists()
+        # Should be executable (mode & 0o111)
+        assert launcher.stat().st_mode & 0o111, "launcher script is not executable"
+
+    def test_mcp_server_tools_list(self, live_mcp_config):
+        """Spawn the MCP server and verify it exposes the expected Devin tools."""
+        import subprocess
+
+        entry = live_mcp_config["opendevin_devin"]
+        launcher = entry["args"][0]
+
+        # JSON-RPC initialize + tools/list handshake
+        handshake = (
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":'
+            '{"protocolVersion":"2024-11-05","capabilities":{},'
+            '"clientInfo":{"name":"hades-agent-smoke-test","version":"0.1.0"}}}'
+            '\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
+        )
+
+        try:
+            proc = subprocess.run(
+                ["bun", "run", launcher],
+                input=handshake,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except FileNotFoundError:
+            pytest.skip("bun executable vanished between check and run")
+        except subprocess.TimeoutExpired:
+            pytest.fail("MCP server did not respond within 30s")
+
+        # Look for expected tool names in the JSON-RPC response lines
+        combined = proc.stdout + proc.stderr
+        expected_tools = {
+            "devin_start",
+            "devin_status",
+            "devin_wait",
+            "devin_cancel",
+            "devin_list",
+            "devin_health",
+            "devin_resumable",
+        }
+        found = {t for t in expected_tools if t in combined}
+        # At least the core tools should be present
+        core = {"devin_start", "devin_status", "devin_wait", "devin_cancel"}
+        missing = core - found
+        assert not missing, f"Core Devin MCP tools missing from server response: {missing}\n\nstdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
