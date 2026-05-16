@@ -73,6 +73,7 @@ SKIP_BROWSER=false
 BRANCH="main"
 ENSURE_DEPS=""
 POSTINSTALL_MODE=false
+INSTALL_DEVIN=false
 
 # Detect non-interactive mode (e.g. curl | bash)
 # When stdin is not a terminal, read -p will fail with EOF,
@@ -119,6 +120,10 @@ while [[ $# -gt 0 ]]; do
             POSTINSTALL_MODE=true
             shift
             ;;
+        --with-devin)
+            INSTALL_DEVIN=true
+            shift
+            ;;
         -h|--help)
             echo "Hermes Agent Installer"
             echo ""
@@ -133,6 +138,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
+            echo "  --with-devin   Install devin-cli and configure bidirectional integration"
             echo "  -h, --help     Show this help"
             echo ""
             echo "Notes:"
@@ -1807,6 +1813,128 @@ maybe_start_gateway() {
     fi
 }
 
+setup_devin_integration() {
+    if [ "$INSTALL_DEVIN" != true ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "Setting up Devin CLI integration..."
+    echo ""
+
+    # 1. Install devin-cli via npm
+    if command -v npm &> /dev/null; then
+        log_info "Installing devin-cli via npm..."
+        if npm install -g devin 2>/dev/null; then
+            log_success "devin-cli installed"
+        else
+            log_warn "npm install -g devin failed (may need sudo). Install manually:"
+            log_info "  npm install -g devin && devin login"
+        fi
+    else
+        log_warn "npm not found. Install Node.js first, then:"
+        log_info "  npm install -g devin && devin login"
+        return 0
+    fi
+
+    # 2. Install bun (required by oh-my-opendevin MCP server)
+    if command -v bun &> /dev/null; then
+        log_success "bun already installed"
+    else
+        log_info "Installing bun (required for oh-my-opendevin)..."
+        if curl -fsSL https://bun.sh/install | bash 2>/dev/null; then
+            log_success "bun installed"
+            # Add bun to PATH for this session
+            export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+            export PATH="$BUN_INSTALL/bin:$PATH"
+        else
+            log_warn "bun installation failed. Install manually:"
+            log_info "  curl -fsSL https://bun.sh/install | bash"
+        fi
+    fi
+
+    # 3. Clone oh-my-opendevin repo
+    OPENDEVIN_DIR="${OH_MY_OPENDEVIN_DIR:-$HOME/oh-my-opendevin}"
+    if [ -d "$OPENDEVIN_DIR/.git" ]; then
+        log_info "oh-my-opendevin already cloned at $OPENDEVIN_DIR"
+    else
+        log_info "Cloning oh-my-opendevin repository..."
+        if git clone --depth 1 https://github.com/NousResearch/oh-my-opendevin.git "$OPENDEVIN_DIR" 2>/dev/null; then
+            log_success "oh-my-opendevin cloned to $OPENDEVIN_DIR"
+        else
+            log_warn "Failed to clone oh-my-opendevin. Clone manually:"
+            log_info "  git clone https://github.com/NousResearch/oh-my-opendevin.git $OPENDEVIN_DIR"
+        fi
+    fi
+
+    # 4. Configure Devin to use Hermes MCP server
+    DEVIN_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/devin"
+    DEVIN_CONFIG="$DEVIN_CONFIG_DIR/config.json"
+
+    mkdir -p "$DEVIN_CONFIG_DIR"
+
+    # Read existing config or create empty one
+    if [ -f "$DEVIN_CONFIG" ]; then
+        existing_config=$(cat "$DEVIN_CONFIG" 2>/dev/null || echo "{}")
+    else
+        existing_config="{}"
+    fi
+
+    # Merge Hermes MCP server config using Python (more reliable than jq for JSON merging)
+    if command -v python3 &> /dev/null || command -v python &> /dev/null; then
+        PYTHON_BIN=$(command -v python3 || command -v python)
+        merged_config=$($PYTHON_BIN -c "
+import json, sys
+cfg = json.loads('''$existing_config''')
+cfg.setdefault('mcpServers', {})
+cfg['mcpServers']['hermes'] = {
+    'command': 'hermes',
+    'args': ['mcp', 'serve']
+}
+print(json.dumps(cfg, indent=2))
+" 2>/dev/null)
+        if [ -n "$merged_config" ]; then
+            echo "$merged_config" > "$DEVIN_CONFIG"
+            log_success "Devin config updated with Hermes MCP server"
+            log_info "Config file: $DEVIN_CONFIG"
+        else
+            log_warn "Could not update Devin config automatically. Add this manually:"
+            log_info "  $DEVIN_CONFIG"
+            cat <<'JSONEOF'
+{
+  "mcpServers": {
+    "hermes": {
+      "command": "hermes",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+JSONEOF
+        fi
+    else
+        log_warn "Python not available to auto-merge config. Add to $DEVIN_CONFIG:"
+        cat <<'JSONEOF'
+{
+  "mcpServers": {
+    "hermes": {
+      "command": "hermes",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+JSONEOF
+    fi
+
+    echo ""
+    log_success "Devin integration setup complete!"
+    echo ""
+    echo -e "${CYAN}Next steps:${NC}"
+    echo -e "   ${GREEN}devin login${NC}          Authenticate with Devin"
+    echo -e "   ${GREEN}devin mcp list${NC}       Verify Hermes MCP server is connected"
+    echo -e "   ${GREEN}hermes mcp serve${NC}     Start Hermes MCP server (for testing)"
+    echo ""
+}
+
 print_success() {
     echo ""
     echo -e "${GREEN}${BOLD}"
@@ -1885,6 +2013,18 @@ print_success() {
             echo "install ripgrep: sudo apt install ripgrep (or brew install ripgrep)"
         fi
         echo -e "${NC}"
+    fi
+
+    # Show Devin integration note if installed
+    if [ "$INSTALL_DEVIN" = true ]; then
+        echo ""
+        echo -e "${CYAN}${BOLD}🔗 Devin Integration:${NC}"
+        echo ""
+        echo -e "   ${GREEN}devin login${NC}          Authenticate with Devin"
+        echo -e "   ${GREEN}devin mcp list${NC}       Verify Hermes MCP server is connected"
+        echo -e "   ${GREEN}hermes mcp serve${NC}     Start Hermes MCP server"
+        echo -e "   ${GREEN}devin${NC}                Start Devin CLI (Hermes tools available)"
+        echo ""
     fi
 }
 
@@ -1994,6 +2134,7 @@ main() {
     copy_config_templates
     run_setup_wizard
     maybe_start_gateway
+    setup_devin_integration
 
     print_success
 }
