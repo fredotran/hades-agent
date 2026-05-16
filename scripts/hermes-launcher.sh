@@ -5,11 +5,12 @@
 # This script checks if Hermes is installed, installs it if missing,
 # then launches the interactive CLI.
 #
-# Usage:
+# Usage (remote install):
 #   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/hermes-launcher.sh | bash
 #
-# Or with Devin integration:
-#   curl -fsSL ... | bash -s -- --with-devin
+# Usage (local repo — from a cloned hades-agent directory):
+#   bash scripts/hermes-launcher.sh
+#   bash scripts/hermes-launcher.sh --with-devin --local
 #
 # Or download and run with options:
 #   ./hermes-launcher.sh --with-devin
@@ -35,13 +36,26 @@ INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/NousResearch/hermes-agent/
 # Options
 WITH_DEVIN=false
 SKIP_INSTALL=false
+LOCAL_MODE=false
 BRANCH="main"
+
+# Auto-detect local mode: if this script lives inside a hermes-agent repo,
+# use the repo's own install script instead of downloading.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/../setup-hermes.sh" ] || [ -f "$SCRIPT_DIR/../pyproject.toml" ]; then
+    LOCAL_REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+    LOCAL_MODE=true
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --with-devin)
             WITH_DEVIN=true
+            shift
+            ;;
+        --local)
+            LOCAL_MODE=true
             shift
             ;;
         --skip-install)
@@ -58,6 +72,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: hermes-launcher.sh [OPTIONS]"
             echo ""
             echo "Options:"
+            echo "  --local        Force local mode (use repo's own install script)"
             echo "  --with-devin   Install with Devin CLI bidirectional integration"
             echo "  --skip-install   Skip installation check (just launch if exists)"
             echo "  --branch NAME    Git branch to install (default: main)"
@@ -67,6 +82,7 @@ while [[ $# -gt 0 ]]; do
             echo "  hermes-launcher.sh                          # Basic install + run"
             echo "  hermes-launcher.sh --with-devin             # With Devin integration"
             echo "  hermes-launcher.sh --skip-install           # Just launch if installed"
+            echo "  hermes-launcher.sh --local --with-devin   # Local repo + Devin"
             exit 0
             ;;
         *)
@@ -86,8 +102,12 @@ hermes_exists() {
     if command -v hermes &> /dev/null; then
         return 0
     fi
-    # Check if entrypoint exists in expected location
+    # Check standard install location
     if [ -x "$INSTALL_DIR/.venv/bin/hermes" ] || [ -x "$INSTALL_DIR/venv/bin/hermes" ]; then
+        return 0
+    fi
+    # Check local repo venv (when running from cloned repo)
+    if [ -n "${LOCAL_REPO_DIR:-}" ] && [ -x "$LOCAL_REPO_DIR/.venv/bin/hermes" ]; then
         return 0
     fi
     return 1
@@ -96,6 +116,10 @@ hermes_exists() {
 # Check if installation directory exists with venv
 installation_present() {
     if [ -d "$INSTALL_DIR/.venv" ] || [ -d "$INSTALL_DIR/venv" ]; then
+        return 0
+    fi
+    # Check local repo venv
+    if [ -n "${LOCAL_REPO_DIR:-}" ] && [ -d "$LOCAL_REPO_DIR/.venv" ]; then
         return 0
     fi
     return 1
@@ -115,7 +139,33 @@ run_installer() {
         install_args="$install_args --branch $BRANCH"
     fi
 
-    # Download and run the official installer
+    # LOCAL MODE: use the repo's own install script
+    if [ "$LOCAL_MODE" = true ] && [ -n "${LOCAL_REPO_DIR:-}" ]; then
+        log_info "Local mode detected — using repo install script at $LOCAL_REPO_DIR"
+        cd "$LOCAL_REPO_DIR"
+
+        if [ -f "$LOCAL_REPO_DIR/scripts/install.sh" ]; then
+            # shellcheck disable=SC2086
+            if ! bash "$LOCAL_REPO_DIR/scripts/install.sh" $install_args; then
+                log_error "Installation failed."
+                exit 1
+            fi
+        elif [ -f "$LOCAL_REPO_DIR/setup-hermes.sh" ]; then
+            if ! bash "$LOCAL_REPO_DIR/setup-hermes.sh"; then
+                log_error "Installation failed."
+                exit 1
+            fi
+        else
+            log_error "No install script found in $LOCAL_REPO_DIR"
+            exit 1
+        fi
+
+        log_success "Installation complete!"
+        echo ""
+        return
+    fi
+
+    # REMOTE MODE: download and run the official installer
     if command -v curl &> /dev/null; then
         log_info "Downloading installer..."
         # shellcheck disable=SC2086
@@ -139,16 +189,19 @@ run_installer() {
 
 # Activate venv and launch hermes
 launch_hermes() {
-    # Find the correct venv
+    # Find the correct venv (prefer local repo, then standard install)
     VENV_DIR=""
-    if [ -d "$INSTALL_DIR/.venv" ]; then
+    if [ -n "${LOCAL_REPO_DIR:-}" ] && [ -d "$LOCAL_REPO_DIR/.venv" ]; then
+        VENV_DIR="$LOCAL_REPO_DIR/.venv"
+        INSTALL_DIR="$LOCAL_REPO_DIR"
+    elif [ -d "$INSTALL_DIR/.venv" ]; then
         VENV_DIR="$INSTALL_DIR/.venv"
     elif [ -d "$INSTALL_DIR/venv" ]; then
         VENV_DIR="$INSTALL_DIR/venv"
     fi
 
     if [ -z "$VENV_DIR" ]; then
-        log_error "Could not find virtual environment in $INSTALL_DIR"
+        log_error "Could not find virtual environment"
         exit 1
     fi
 
