@@ -550,6 +550,60 @@ hermes gateway restart
 devin: "List available MCP tools"
 ```
 
+## Verification
+
+### Running Integration Tests
+
+The Hermes repository includes a comprehensive test suite and verification script for the Devin integration.
+
+#### Unit Tests
+
+```bash
+cd /path/to/hades-agent
+source .venv/bin/activate
+
+# Run all Devin integration tests
+python3 -m pytest tests/tools/test_devin_integration.py -v
+
+# Expected output: 51 passed, 1 skipped
+```
+
+#### Comprehensive Verification Script
+
+```bash
+# Safe mode (default): runs unit tests with mocks + MCP server handshake
+python3 tests/tools/verify_devin_integration.py
+
+# Expected output:
+# Summary
+#   Passes:  41
+#   Skips:   1
+#   Failures: 0
+#
+# ALL CHECKS PASSED
+```
+
+#### Live Session Test (Optional)
+
+```bash
+# Live mode: starts a real Devin session (consumes API quota)
+python3 tests/tools/verify_devin_integration.py --live
+```
+
+### Test Coverage
+
+The verification covers:
+
+1. **Auto-discovery** of oh-my-opendevin repository
+2. **MCP server config generation**
+3. **Tool registration** in Hermes toolsets
+4. **Model validation** and config defaults
+5. **Session lifecycle** (start, wait, cancel, bind)
+6. **Thread safety** and cleanup
+7. **Subagent bridge** (DevinSubagent proxy)
+8. **Role normalization**
+9. **Live MCP handshake** (if checkout available)
+
 ## Best Practices
 
 ### 1. Start Simple
