@@ -128,6 +128,29 @@ Hermes Agent can run as an MCP server, exposing its messaging capabilities to de
 
 #### 1. Install Hermes Agent
 
+**Quick Start (One Command)** — Use the launcher script that installs and runs in one step:
+
+```bash
+# Linux, macOS, WSL2, Termux
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/hermes-launcher.sh | bash
+
+# With Devin CLI integration
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/hermes-launcher.sh | bash -s -- --with-devin
+
+# Skip install if already installed (just launch)
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/hermes-launcher.sh | bash -s -- --skip-install
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/hermes-launcher.ps1 | iex
+
+# With Devin CLI integration
+irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/hermes-launcher.ps1 | iex -WithDevin
+```
+
+**Manual Install** — If you prefer to install separately:
+
 ```bash
 # Linux, macOS, WSL2, Termux
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
