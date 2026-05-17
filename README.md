@@ -82,6 +82,166 @@ hermes doctor       # Diagnose any issues
 
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
 
+## Devin CLI Integration
+
+Hermes Agent now integrates with [Devin CLI](https://cli.devin.ai) via the [oh-my-opendevin](https://github.com/NousResearch/oh-my-opendevin) repository. This integration allows Hermes to delegate coding tasks to Devin's specialized AI agent while maintaining its own messaging, automation, and learning capabilities.
+
+### Overview
+
+The integration provides **one-way delegation** from Hermes to Devin:
+- Hermes acts as the communication and automation hub
+- Devin handles specialized coding and development tasks
+- Tasks are delegated via MCP (Model Context Protocol)
+- Background sessions with completion notifications
+- Parallel task execution with status monitoring
+
+### Quick Setup
+
+#### Automated Installation (Recommended)
+
+```bash
+# Install Hermes with Devin integration
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --with-devin
+
+# Reload shell
+source ~/.bashrc  # or source ~/.zshrc
+```
+
+This automatically:
+- Installs devin-cli via npm
+- Installs bun (required for oh-my-opendevin)
+- Clones or detects oh-my-opendevin repository
+- Sets `OH_MY_OPENDEVIN_PATH` environment variable
+- Adds "devin" toolset to Hermes config
+- Configures Hermes MCP server in Devin config
+
+#### Manual Setup
+
+If you prefer manual setup:
+
+```bash
+# 1. Install prerequisites
+npm install -g devin
+curl -fsSL https://bun.sh/install | bash
+devin login
+
+# 2. Clone oh-my-opendevin
+git clone https://github.com/NousResearch/oh-my-opendevin ~/Code/oh-my-opendevin
+cd ~/Code/oh-my-opendevin && bun install && bun run build
+
+# 3. Set environment variable
+export OH_MY_OPENDEVIN_PATH=~/Code/oh-my-opendevin
+# Add to ~/.bashrc or ~/.zshrc
+
+# 4. Enable devin toolset in Hermes
+hermes tools enable devin
+
+# 5. Configure Hermes MCP server in Devin config
+# Add to ~/.config/devin/config.json:
+# {
+#   "mcpServers": {
+#     "hermes": {
+#       "command": "hermes",
+#       "args": ["mcp", "serve"]
+#     }
+#   }
+# }
+
+# 6. Verify connection
+devin mcp list
+```
+
+### Usage Examples
+
+#### Delegate a Task
+
+```bash
+# In Hermes CLI
+> Implement a REST API endpoint for user authentication
+# Hermes automatically delegates to Devin via devin_delegate tool
+```
+
+#### Check Session Status
+
+```bash
+# List all active Devin sessions
+> /devin
+```
+
+#### Parallel Task Execution
+
+```bash
+# Run multiple tasks concurrently
+> Implement unit tests for the auth module
+> Write API documentation for the auth endpoints
+> Create a Dockerfile for the auth service
+# Each task spawns a separate Devin session
+```
+
+#### Background Tasks with Notifications
+
+```bash
+# Start a long-running task in the background
+> /background Implement a comprehensive test suite
+# Get notified when complete via your messaging platform
+```
+
+### Configuration
+
+Set your preferred default Devin model in `~/.hermes/config.yaml`:
+
+```yaml
+devin:
+  model: "sonnet"  # Options: opus, sonnet, kimi-k2.6, swe
+```
+
+Or use the delegation section:
+
+```yaml
+delegation:
+  devin_model: "sonnet"
+```
+
+### Health Check
+
+Verify your Devin integration is working:
+
+```bash
+# Run comprehensive verification
+python3 tests/tools/verify_devin_integration.py
+
+# Check specific components
+python3 -c "from tools.devin_discovery import discover_opendevin_repo; print(discover_opendevin_repo())"
+which bun
+devin mcp list
+```
+
+### Troubleshooting
+
+**"Devin MCP tool not found"**
+- Check oh-my-opendevin repo is discoverable
+- Verify bun is installed: `which bun`
+- Ensure MCP server is built: `ls ~/Code/oh-my-opendevin/dist/mcp-servers/devin/index.js`
+
+**"oh-my-opendevin repo not found"**
+- Set environment variable: `export OH_MY_OPENDEVIN_PATH=/path/to/oh-my-opendevin`
+- Or clone to a known location like `~/Code/oh-my-opendevin`
+
+**"bun not on PATH"**
+- Install bun: `curl -fsSL https://bun.sh/install | bash`
+- Add `~/.bun/bin` to your PATH
+
+**Gateway notification not sent**
+- Ensure Hermes gateway is running
+- In CLI mode, notifications fall back to logging
+- Check gateway status: `hermes gateway status`
+
+### Advanced Workflows
+
+For detailed architecture, advanced configurations, and troubleshooting, see the [complete integration guide](docs/DEVIN_INTEGRATION.md).
+
+---
+
 ## CLI vs Messaging Quick Reference
 
 Hermes has two entry points: start the terminal UI with `hermes`, or run the gateway and talk to it from Telegram, Discord, Slack, WhatsApp, Signal, or Email. Once you're in a conversation, many slash commands are shared across both interfaces.
