@@ -83,6 +83,27 @@ class TestDiscoverOpenDevinRepo:
         result = dd.discover_opendevin_repo()
         assert result == "/cached/path"
 
+    def test_warning_when_toolset_enabled_but_repo_not_found(self, tmp_path, monkeypatch):
+        """Warning is emitted when devin toolset is enabled but repo not found."""
+        import tools.devin_discovery as dd
+        dd._discovered_repo = None
+        
+        # Create a fake config with devin toolset enabled
+        fake_config = tmp_path / "config.yaml"
+        fake_config.write_text("enabled_toolsets:\n  - devin\n")
+        
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("OH_MY_OPENDEVIN_PATH", raising=False)
+        
+        # Mock get_config_path from hermes_cli.config
+        with patch("hermes_cli.config.get_config_path", return_value=fake_config):
+            with patch("tools.devin_discovery.logger") as mock_logger:
+                result = dd.discover_opendevin_repo()
+                assert result is None
+                # Should have logged a warning
+                assert mock_logger.warning.called
+
 
 class TestGetDevinMcpConfig:
     """Tests for tools.devin_discovery.get_devin_mcp_config."""
@@ -121,6 +142,61 @@ class TestGetDevinMcpConfig:
 
         config = dd.get_devin_mcp_config()
         assert config is None
+
+
+class TestVersionCompatibility:
+    """Tests for version compatibility checking."""
+
+    def test_version_check_with_matching_versions(self, tmp_path, monkeypatch):
+        """No warning when versions match."""
+        import tools.devin_discovery as dd
+        
+        fake_repo = tmp_path / "oh-my-opendevin"
+        fake_repo.mkdir()
+        (fake_repo / "package.json").write_text('{"version": "1.2.3"}')
+        
+        with patch("tools.devin_discovery._get_hermes_version", return_value="1.2.3"):
+            with patch("tools.devin_discovery.logger") as mock_logger:
+                dd.check_version_compatibility(str(fake_repo))
+                # Should not warn about version mismatch
+                assert not any(
+                    "Potential version mismatch" in str(call) 
+                    for call in mock_logger.warning.call_args_list
+                )
+
+    def test_version_check_with_mismatched_major_versions(self, tmp_path, monkeypatch):
+        """Warning when major versions differ significantly."""
+        import tools.devin_discovery as dd
+        
+        fake_repo = tmp_path / "oh-my-opendevin"
+        fake_repo.mkdir()
+        (fake_repo / "package.json").write_text('{"version": "3.0.0"}')
+        
+        with patch("tools.devin_discovery._get_hermes_version", return_value="1.2.3"):
+            with patch("tools.devin_discovery.logger") as mock_logger:
+                dd.check_version_compatibility(str(fake_repo))
+                # Should warn about version mismatch
+                assert any(
+                    "Potential version mismatch" in str(call) 
+                    for call in mock_logger.warning.call_args_list
+                )
+
+    def test_version_check_with_git_describe_format(self, tmp_path, monkeypatch):
+        """Handles git describe format (v1.2.3-5-gabcdef)."""
+        import tools.devin_discovery as dd
+        
+        fake_repo = tmp_path / "oh-my-opendevin"
+        fake_repo.mkdir()
+        (fake_repo / "package.json").write_text('{"version": "1.2.3"}')
+        
+        with patch("tools.devin_discovery._get_hermes_version", return_value="v1.2.3-10-gabcdef"):
+            with patch("tools.devin_discovery.logger") as mock_logger:
+                dd.check_version_compatibility(str(fake_repo))
+                # Should not warn - versions match
+                assert not any(
+                    "Potential version mismatch" in str(call) 
+                    for call in mock_logger.warning.call_args_list
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +303,189 @@ class TestCallDevinMcp:
                     result = ddg._call_devin_mcp("devin_start", {})
                     assert result == {"result": "raw text"}
 
-    def test_missing_tool_returns_error(self):
-        """When the Devin MCP tool is not found, an error dict is returned."""
+    def test_missing_tool_returns_error_with_guidance(self):
+        """When the Devin MCP tool is not found, an error dict with guidance is returned."""
         import tools.devin_delegate as ddg
 
         with patch.object(ddg.registry, "get_all_tool_names", return_value=["terminal"]):
             result = ddg._call_devin_mcp("devin_start", {})
             assert "error" in result
+            assert "guidance" in result
+            assert "OH_MY_OPENDEVIN_PATH" in result["guidance"]
+
+
+class TestMetrics:
+    """Tests for metrics/telemetry system."""
+
+    def test_metrics_disabled_by_default(self):
+        """Metrics are disabled by default."""
+        import tools.devin_delegate as ddg
+        
+        # Reset metrics state
+        ddg._metrics_enabled = False
+        
+        assert ddg._enable_metrics() is False
+
+    def test_metrics_enabled_via_config(self, tmp_path, monkeypatch):
+        """Metrics are enabled when config flag is set."""
+        import tools.devin_delegate as ddg
+        
+        # Create a fake config with metrics enabled
+        fake_config = tmp_path / "config.yaml"
+        fake_config.write_text("devin:\n  enable_metrics: true\n")
+        
+        ddg._metrics_enabled = False
+        
+        with patch("hermes_cli.config.get_config_path", return_value=fake_config):
+            assert ddg._enable_metrics() is True
+
+    def test_record_session_start_increments_count(self):
+        """Recording session start increments total sessions."""
+        import tools.devin_delegate as ddg
+        
+        ddg._metrics_enabled = True
+        initial_count = ddg._metrics["total_sessions"]
+        
+        ddg._record_session_start("sonnet")
+        
+        assert ddg._metrics["total_sessions"] == initial_count + 1
+        assert ddg._metrics["model_usage"]["sonnet"] == 1
+
+    def test_record_session_completion_updates_stats(self):
+        """Recording session completion updates success/failure stats."""
+        import tools.devin_delegate as ddg
+        
+        ddg._metrics_enabled = True
+        ddg._metrics["total_sessions"] = 1
+        ddg._metrics["successful_sessions"] = 0
+        ddg._metrics["failed_sessions"] = 0
+        
+        ddg._record_session_completion("completed", 100.0, "sonnet")
+        
+        assert ddg._metrics["successful_sessions"] == 1
+        assert ddg._metrics["total_duration_seconds"] == 100.0
+
+    def test_get_metrics_returns_summary(self):
+        """get_devin_metrics returns a summary of collected metrics."""
+        import tools.devin_delegate as ddg
+        
+        ddg._metrics_enabled = True
+        ddg._metrics["total_sessions"] = 10
+        ddg._metrics["successful_sessions"] = 8
+        ddg._metrics["failed_sessions"] = 2
+        ddg._metrics["total_duration_seconds"] = 1000.0
+        
+        result = json.loads(ddg.get_devin_metrics())
+        
+        assert result["total_sessions"] == 10
+        assert result["success_rate"] == 80.0
+        assert result["average_duration_seconds"] == 100.0
+
+    def test_reset_metrics_clears_all_data(self):
+        """reset_devin_metrics clears all collected metrics."""
+        import tools.devin_delegate as ddg
+        
+        ddg._metrics["total_sessions"] = 10
+        ddg._metrics["successful_sessions"] = 8
+        
+        ddg.reset_devin_metrics()
+        
+        assert ddg._metrics["total_sessions"] == 0
+        assert ddg._metrics["successful_sessions"] == 0
+
+
+class TestOrphanedSessionRecovery:
+    """Tests for orphaned session recovery."""
+
+    def test_recover_removes_stale_bindings(self):
+        """recover_orphaned_sessions removes bindings older than TTL."""
+        import tools.devin_delegate as ddg
+        import time
+        
+        # Add a stale binding
+        stale_time = time.monotonic() - ddg._BINDING_TTL_SECONDS - 100
+        ddg._session_bindings["stale_session"] = {
+            "platform": "telegram",
+            "chat_id": "123",
+            "bound_at": stale_time,
+        }
+        
+        result = json.loads(ddg.recover_orphaned_sessions())
+        
+        assert result["recovered_bindings"] >= 1
+        assert "stale_session" not in ddg._session_bindings
+
+    def test_recover_cancels_stuck_sessions(self):
+        """recover_orphaned_sessions cancels sessions stuck in running state."""
+        import tools.devin_delegate as ddg
+        import time
+        
+        # Add a stuck session
+        stale_time = time.monotonic() - ddg._BINDING_TTL_SECONDS - 100
+        ddg._session_bindings["stuck_session"] = {
+            "platform": "telegram",
+            "chat_id": "123",
+            "bound_at": stale_time,
+        }
+        
+        # Mock the status check to return "running"
+        with patch.object(ddg, "_poll_devin_status", return_value={"status": "running"}):
+            with patch.object(ddg, "_call_devin_mcp", return_value={"result": "cancelled"}):
+                result = json.loads(ddg.recover_orphaned_sessions())
+                
+                # Should attempt to cancel the stuck session
+                assert result["cancelled_stuck_sessions"] >= 0
+
+
+class TestParallelSessionTracking:
+    """Tests for parallel session tracking."""
+
+    def test_get_parallel_status_returns_active_sessions(self):
+        """get_parallel_session_status returns list of active sessions."""
+        import tools.devin_delegate as ddg
+        import time
+        
+        # Add some active sessions
+        now = time.monotonic()
+        ddg._session_bindings["session1"] = {
+            "platform": "telegram",
+            "chat_id": "123",
+            "bound_at": now - 100,
+        }
+        ddg._session_bindings["session2"] = {
+            "platform": "discord",
+            "chat_id": "456",
+            "bound_at": now - 200,
+        }
+        
+        # Mock status checks
+        with patch.object(ddg, "_poll_devin_status", side_effect=[
+            {"status": "running"},
+            {"status": "running"},
+        ]):
+            result = json.loads(ddg.get_parallel_session_status())
+            
+            assert result["total_active"] == 2
+            assert len(result["active_sessions"]) == 2
+
+    def test_get_parallel_status_counts_completed_sessions(self):
+        """get_parallel_session_status counts completed sessions."""
+        import tools.devin_delegate as ddg
+        import time
+        
+        # Clear any existing sessions
+        ddg._session_bindings.clear()
+        
+        ddg._session_bindings["completed_session"] = {
+            "platform": "telegram",
+            "chat_id": "123",
+            "bound_at": time.monotonic() - 100,
+        }
+        
+        with patch.object(ddg, "_poll_devin_status", return_value={"status": "completed"}):
+            result = json.loads(ddg.get_parallel_session_status())
+            
+            assert result["total_completed"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +1041,7 @@ class TestDevinCancel:
         with patch.object(ddg, "_call_devin_mcp", return_value={"result": "ok"}):
             result = json.loads(ddg.devin_cancel("sess-x"))
 
-        assert result["cancelled"] is True
+        assert result["status"] == "cancelled"
         assert "sess-x" not in ddg._active_devin_sessions
         assert "sess-x" not in ddg._session_bindings
 

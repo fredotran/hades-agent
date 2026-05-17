@@ -21,6 +21,8 @@ import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
+from collections import defaultdict
+from datetime import datetime
 
 from tools.registry import registry
 
@@ -37,6 +39,140 @@ _BASE_POLL_INTERVAL_SECONDS = 2
 _MAX_POLL_INTERVAL_SECONDS = 60
 # Bindings older than this are auto-purged by the monitor
 _BINDING_TTL_SECONDS = 86400  # 24 hours
+
+
+# ---------------------------------------------------------------------------
+# Optional Metrics/Telemetry System
+# ---------------------------------------------------------------------------
+
+# Metrics storage (thread-safe)
+_metrics_lock = threading.Lock()
+_metrics: Dict[str, Any] = {
+    "total_sessions": 0,
+    "successful_sessions": 0,
+    "failed_sessions": 0,
+    "cancelled_sessions": 0,
+    "total_duration_seconds": 0.0,
+    "model_usage": defaultdict(int),
+    "error_counts": defaultdict(int),
+    "session_history": [],  # Last 100 sessions
+}
+_metrics_enabled = False
+
+
+def _enable_metrics() -> bool:
+    """Check if metrics collection is enabled via config."""
+    global _metrics_enabled
+    if _metrics_enabled:
+        return True
+    
+    try:
+        from hermes_cli.config import get_config_path
+        cfg_path = get_config_path()
+        if cfg_path.exists():
+            import yaml
+            with open(cfg_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            _metrics_enabled = config.get("devin", {}).get("enable_metrics", False)
+    except Exception as exc:
+        logger.debug("Could not check metrics config: %s", exc)
+    
+    return _metrics_enabled
+
+
+def _record_session_start(model: str) -> None:
+    """Record the start of a Devin session for metrics."""
+    if not _enable_metrics():
+        return
+    
+    with _metrics_lock:
+        _metrics["total_sessions"] += 1
+        _metrics["model_usage"][model] += 1
+
+
+def _record_session_completion(status: str, duration_seconds: float, model: str, error_tag: Optional[str] = None) -> None:
+    """Record the completion of a Devin session for metrics."""
+    if not _enable_metrics():
+        return
+    
+    with _metrics_lock:
+        _metrics["total_duration_seconds"] += duration_seconds
+        
+        if status == "completed":
+            _metrics["successful_sessions"] += 1
+        elif status == "error":
+            _metrics["failed_sessions"] += 1
+            if error_tag:
+                _metrics["error_counts"][error_tag] += 1
+        elif status == "cancelled":
+            _metrics["cancelled_sessions"] += 1
+        
+        # Add to history (keep last 100)
+        session_record = {
+            "timestamp": datetime.now().isoformat(),
+            "status": status,
+            "duration_seconds": duration_seconds,
+            "model": model,
+            "error_tag": error_tag,
+        }
+        _metrics["session_history"].append(session_record)
+        if len(_metrics["session_history"]) > 100:
+            _metrics["session_history"] = _metrics["session_history"][-100:]
+
+
+def get_devin_metrics() -> str:
+    """Get collected metrics about Devin session usage.
+    
+    Returns JSON with:
+    - total_sessions: total number of sessions
+    - successful_sessions: count of successful sessions
+    - failed_sessions: count of failed sessions
+    - cancelled_sessions: count of cancelled sessions
+    - success_rate: percentage of successful sessions
+    - average_duration_seconds: average session duration
+    - model_usage: dict of model usage counts
+    - error_counts: dict of error type counts
+    - session_history: list of recent sessions (last 100)
+    """
+    if not _enable_metrics():
+        return json.dumps({
+            "error": "Metrics not enabled. Set devin.enable_metrics: true in config.yaml"
+        }, ensure_ascii=False)
+    
+    with _metrics_lock:
+        total = _metrics["total_sessions"]
+        success_rate = (_metrics["successful_sessions"] / total * 100) if total > 0 else 0.0
+        avg_duration = (_metrics["total_duration_seconds"] / total) if total > 0 else 0.0
+        
+        return json.dumps({
+            "total_sessions": total,
+            "successful_sessions": _metrics["successful_sessions"],
+            "failed_sessions": _metrics["failed_sessions"],
+            "cancelled_sessions": _metrics["cancelled_sessions"],
+            "success_rate": round(success_rate, 2),
+            "average_duration_seconds": round(avg_duration, 2),
+            "model_usage": dict(_metrics["model_usage"]),
+            "error_counts": dict(_metrics["error_counts"]),
+            "session_history": _metrics["session_history"],
+        }, ensure_ascii=False)
+
+
+def reset_devin_metrics() -> str:
+    """Reset all collected Devin metrics.
+    
+    Returns JSON with confirmation.
+    """
+    with _metrics_lock:
+        _metrics["total_sessions"] = 0
+        _metrics["successful_sessions"] = 0
+        _metrics["failed_sessions"] = 0
+        _metrics["cancelled_sessions"] = 0
+        _metrics["total_duration_seconds"] = 0.0
+        _metrics["model_usage"] = defaultdict(int)
+        _metrics["error_counts"] = defaultdict(int)
+        _metrics["session_history"] = []
+    
+    return json.dumps({"status": "metrics_reset"}, ensure_ascii=False)
 
 
 def _find_devin_mcp_tool(base_name: str) -> Optional[str]:
@@ -67,8 +203,19 @@ def _call_devin_mcp(tool_base_name: str, args: dict) -> dict:
     """
     tool_name = _find_devin_mcp_tool(tool_base_name)
     if not tool_name:
-        return {"error": f"Devin MCP tool '{tool_base_name}' not found. "
-                          f"Is the oh-my-opendevin MCP server connected?"}
+        return {
+            "error": f"Devin MCP tool '{tool_base_name}' not found. "
+                     f"Is the oh-my-opendevin MCP server connected?",
+            "guidance": (
+                "To fix this:\n"
+                "1. Ensure oh-my-opendevin is installed: git clone https://github.com/NousResearch/oh-my-opendevin.git ~/Code/oh-my-opendevin\n"
+                "2. Set OH_MY_OPENDEVIN_PATH: export OH_MY_OPENDEVIN_PATH=~/Code/oh-my-opendevin\n"
+                "3. Install bun: curl -fsSL https://bun.sh/install | bash\n"
+                "4. Enable devin toolset: hermes tools enable devin\n"
+                "5. Restart Hermes\n"
+                "Run '/devin' in Hermes for detailed status."
+            )
+        }
 
     raw = registry.dispatch(tool_name, args)
     try:
@@ -413,6 +560,7 @@ def devin_delegate(
       - duration_seconds
       - model (resolved model)
       - error_tag (RATE_LIMIT, QUOTA_EXCEEDED, CONTEXT_LIMIT, UNKNOWN)
+      - guidance (remediation steps for errors)
     """
     start_time = time.monotonic()
 
@@ -420,6 +568,10 @@ def devin_delegate(
     current_model = model
     attempts = 0
     max_attempts = len(_DEVIN_FALLBACK_CHAIN) + 1
+    
+    # Record session start for metrics
+    resolved_model = current_model or _get_default_model()
+    _record_session_start(resolved_model)
 
     while attempts < max_attempts:
         attempts += 1
@@ -448,12 +600,59 @@ def devin_delegate(
                 continue
 
         # Non-quota error or out of fallback options
-        return json.dumps({
-            "error": start_result["error"],
+        error_msg = start_result["error"]
+        error_tag = _extract_error_tag(error_msg)
+        
+        # Add specific guidance based on error type
+        guidance = None
+        if error_tag == "QUOTA_EXCEEDED":
+            guidance = (
+                "All Devin models in the fallback chain are quota-exceeded.\n"
+                "To fix this:\n"
+                "1. Check your Devin account quota at https://cli.devin.ai\n"
+                "2. Upgrade your plan if needed\n"
+                "3. Try again later when quota resets"
+            )
+        elif error_tag == "RATE_LIMIT":
+            guidance = (
+                "Rate limit exceeded. Too many requests in a short time.\n"
+                "To fix this:\n"
+                "1. Wait a few minutes before retrying\n"
+                "2. Reduce concurrent Devin sessions\n"
+                "3. Check your rate limits at https://cli.devin.ai"
+            )
+        elif error_tag == "CONTEXT_LIMIT":
+            guidance = (
+                "Context limit exceeded. The task prompt or workspace is too large.\n"
+                "To fix this:\n"
+                "1. Break the task into smaller sub-tasks\n"
+                "2. Reduce the scope of the prompt\n"
+                "3. Use a model with larger context window"
+            )
+        elif "not found" in error_msg.lower() or "not connected" in error_msg.lower():
+            guidance = (
+                "Devin MCP server not available.\n"
+                "To fix this:\n"
+                "1. Run '/devin' in Hermes to check integration status\n"
+                "2. Ensure oh-my-opendevin is installed and OH_MY_OPENDEVIN_PATH is set\n"
+                "3. Restart Hermes to reload MCP tools\n"
+                "4. Run 'hermes tools enable devin' if toolset is disabled"
+            )
+        
+        result = {
+            "error": error_msg,
             "model": current_model,
             "attempts": attempts,
-            "error_tag": _extract_error_tag(start_result["error"]),
-        }, ensure_ascii=False)
+            "error_tag": error_tag,
+        }
+        if guidance:
+            result["guidance"] = guidance
+        
+        # Record session completion for metrics
+        duration = time.monotonic() - start_time
+        _record_session_completion("error", duration, current_model, error_tag)
+        
+        return json.dumps(result, ensure_ascii=False)
 
     session_id = start_result.get("session_id", "")
     if not session_id:
@@ -488,24 +687,59 @@ def devin_delegate(
             wait_result = _wait_devin_session(session_id, timeout_ms=30000)
 
             if "error" in wait_result:
-                return json.dumps({
+                error_msg = wait_result["error"]
+                error_tag = _extract_error_tag(error_msg)
+                
+                # Add guidance for wait errors
+                guidance = None
+                if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                    guidance = (
+                        "Devin session timed out. The task may be taking longer than expected.\n"
+                        "To fix this:\n"
+                        "1. Increase max_duration_ms parameter (default is 2 hours)\n"
+                        "2. Break the task into smaller sub-tasks\n"
+                        "3. Check if the task is stuck in an infinite loop"
+                    )
+                elif "cancelled" in error_msg.lower():
+                    guidance = (
+                        "Devin session was cancelled.\n"
+                        "This may happen if:\n"
+                        "1. You manually cancelled the session\n"
+                        "2. The session exceeded max duration\n"
+                        "3. Hermes was shut down during the session"
+                    )
+                
+                result = {
                     "session_id": session_id,
                     "status": "error",
-                    "summary": wait_result["error"],
+                    "summary": error_msg,
                     "model": resolved_model,
                     "duration_seconds": round(time.monotonic() - start_time, 2),
-                    "error_tag": _extract_error_tag(wait_result["error"]),
-                }, ensure_ascii=False)
+                    "error_tag": error_tag,
+                }
+                if guidance:
+                    result["guidance"] = guidance
+                
+                # Record session completion for metrics
+                duration = time.monotonic() - start_time
+                _record_session_completion("error", duration, resolved_model, error_tag)
+                
+                return json.dumps(result, ensure_ascii=False)
 
             if wait_result.get("exited"):
                 status = wait_result.get("status", "unknown")
                 output = wait_result.get("output", "")
+                duration = time.monotonic() - start_time
+                
+                # Record session completion for metrics
+                _record_session_completion(status, duration, resolved_model)
+                
                 return json.dumps({
                     "session_id": session_id,
                     "status": status,
                     "summary": output,
                     "model": resolved_model,
-                    "duration_seconds": round(time.monotonic() - start_time, 2),
+                    "duration_seconds": round(duration, 2),
                 }, ensure_ascii=False)
 
             # Still running — poll incrementally for progress
@@ -530,12 +764,17 @@ def devin_delegate(
             time.sleep(min(sleep_seconds, remaining))
 
         # Max wait exceeded
+        duration = time.monotonic() - start_time
+        
+        # Record session completion for metrics (timeout is treated as error)
+        _record_session_completion("timeout", duration, resolved_model)
+        
         return json.dumps({
             "session_id": session_id,
             "status": "timeout",
             "summary": f"Devin session {session_id} did not complete within {total_wait_limit}s.",
             "model": resolved_model,
-            "duration_seconds": round(time.monotonic() - start_time, 2),
+            "duration_seconds": round(duration, 2),
         }, ensure_ascii=False)
     finally:
         # Stop tracking for atexit cleanup once we leave the wait loop
@@ -571,17 +810,170 @@ def devin_cancel(session_id: str, task_id: Optional[str] = None) -> str:
     """
     result = _call_devin_mcp("devin_cancel", {"session_id": session_id})
     text = _extract_text_from_mcp_result(result)
-
-    if "error" in result:
-        return json.dumps({"error": text}, ensure_ascii=False)
-
+    
+    # Unbind the session if it was bound for notifications
+    _session_bindings.pop(session_id, None)
+    
+    # Stop tracking for atexit cleanup
     _untrack_session(session_id)
-    unbind_session(session_id)
-
+    
     return json.dumps({
         "session_id": session_id,
-        "cancelled": True,
-        "raw": text,
+        "status": "cancelled",
+        "summary": text,
+    }, ensure_ascii=False)
+
+
+def recover_orphaned_sessions() -> str:
+    """Recover and clean up orphaned Devin sessions.
+    
+    Orphaned sessions are those that:
+    - Are still bound in _session_bindings but no longer active
+    - Are tracked in _active_devin_sessions but the process has exited
+    
+    Returns JSON with recovery status and actions taken.
+    """
+    recovered_count = 0
+    cancelled_count = 0
+    errors = []
+    
+    # 1. Clean up stale bindings
+    with _sessions_lock:
+        bindings_to_remove = []
+        for session_id, binding in _session_bindings.items():
+            bound_at = binding.get("bound_at", 0)
+            # Remove bindings older than 24 hours
+            if time.monotonic() - bound_at > _BINDING_TTL_SECONDS:
+                bindings_to_remove.append(session_id)
+        
+        for session_id in bindings_to_remove:
+            try:
+                _session_bindings.pop(session_id, None)
+                recovered_count += 1
+                logger.info("Recovered stale binding for orphaned session %s", session_id)
+            except Exception as exc:
+                errors.append(f"Failed to remove binding {session_id}: {exc}")
+    
+    # 2. Check and cancel tracked sessions that are no longer active
+    with _sessions_lock:
+        sessions_to_cancel = list(_active_devin_sessions)
+    
+    for session_id in sessions_to_cancel:
+        try:
+            # Check if the session is still active
+            status_result = _poll_devin_status(session_id)
+            if "error" in status_result:
+                # Session is no longer accessible, clean up tracking
+                _untrack_session(session_id)
+                recovered_count += 1
+                logger.info("Cleaned up tracking for inaccessible session %s", session_id)
+            else:
+                status = status_result.get("status", "").lower()
+                # If session is in terminal state, clean up tracking
+                if status in ("completed", "error", "cancelled"):
+                    _untrack_session(session_id)
+                    recovered_count += 1
+                    logger.info("Cleaned up tracking for completed session %s", session_id)
+        except Exception as exc:
+            errors.append(f"Failed to check session {session_id}: {exc}")
+    
+    # 3. Try to cancel any sessions that are stuck in "running" state but have bindings
+    # This is a best-effort cleanup
+    with _sessions_lock:
+        for session_id, binding in list(_session_bindings.items()):
+            try:
+                status_result = _poll_devin_status(session_id)
+                if "error" not in status_result:
+                    status = status_result.get("status", "").lower()
+                    if status == "running":
+                        # Check if it's been running for too long (> 24 hours)
+                        bound_at = binding.get("bound_at", 0)
+                        if time.monotonic() - bound_at > _BINDING_TTL_SECONDS:
+                            # Attempt to cancel the stuck session
+                            cancel_result = _call_devin_mcp("devin_cancel", {"session_id": session_id})
+                            if "error" not in cancel_result:
+                                cancelled_count += 1
+                                _session_bindings.pop(session_id, None)
+                                logger.info("Cancelled stuck session %s", session_id)
+            except Exception as exc:
+                errors.append(f"Failed to cancel stuck session {session_id}: {exc}")
+    
+    return json.dumps({
+        "recovered_bindings": recovered_count,
+        "cancelled_stuck_sessions": cancelled_count,
+        "errors": errors,
+    }, ensure_ascii=False)
+
+
+def get_parallel_session_status() -> str:
+    """Get status of all parallel/concurrent Devin sessions.
+    
+    Returns JSON with:
+    - active_sessions: list of running sessions with their status
+    - total_active: count of active sessions
+    - total_completed: count of completed sessions (in bindings)
+    - total_errors: count of errored sessions (in bindings)
+    """
+    active_sessions = []
+    completed_count = 0
+    error_count = 0
+    
+    with _sessions_lock:
+        # Check all bound sessions
+        for session_id, binding in _session_bindings.items():
+            try:
+                status_result = _poll_devin_status(session_id)
+                if "error" not in status_result:
+                    status = status_result.get("status", "").lower()
+                    bound_at = binding.get("bound_at", 0)
+                    age_seconds = time.monotonic() - bound_at
+                    
+                    session_info = {
+                        "session_id": session_id,
+                        "status": status,
+                        "age_seconds": round(age_seconds, 2),
+                        "platform": binding.get("platform"),
+                        "chat_id": binding.get("chat_id"),
+                    }
+                    
+                    if status == "running":
+                        active_sessions.append(session_info)
+                    elif status == "completed":
+                        completed_count += 1
+                    elif status in ("error", "cancelled"):
+                        error_count += 1
+                else:
+                    error_count += 1
+            except Exception as exc:
+                logger.debug("Failed to get status for session %s: %s", session_id, exc)
+                error_count += 1
+    
+    # Also check tracked sessions (those started by this process)
+    with _sessions_lock:
+        for session_id in _active_devin_sessions:
+            # Skip if already in bindings
+            if session_id in _session_bindings:
+                continue
+            try:
+                status_result = _poll_devin_status(session_id)
+                if "error" not in status_result:
+                    status = status_result.get("status", "").lower()
+                    if status == "running":
+                        active_sessions.append({
+                            "session_id": session_id,
+                            "status": status,
+                            "age_seconds": 0,  # Unknown age for tracked sessions
+                            "platform": None,
+                            "chat_id": None,
+                        })
+            except Exception as exc:
+                logger.debug("Failed to get status for tracked session %s: %s", session_id, exc)
+    
+    return json.dumps({
+        "active_sessions": active_sessions,
+        "total_active": len(active_sessions),
+        "total_completed": completed_count,
+        "total_errors": error_count,
     }, ensure_ascii=False)
 
 

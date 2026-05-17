@@ -7934,6 +7934,8 @@ class HermesCLI:
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
             self._handle_debug_command()
+        elif canonical == "devin":
+            self._handle_devin_command(cmd_original)
         elif canonical == "paste":
             self._handle_paste_command()
         elif canonical == "image":
@@ -9214,6 +9216,128 @@ class HermesCLI:
 
         args = SimpleNamespace(lines=200, expire=7, local=False)
         run_debug_share(args)
+
+    def _handle_devin_command(self, cmd_original: str):
+        """Handle /devin — show Devin integration status and session information."""
+        import json
+        import subprocess
+        from tools.devin_discovery import discover_opendevin_repo, get_devin_mcp_config
+        from tools.devin_delegate import _devin_mcp_available
+        
+        print()
+        print("🤖 Devin Integration Status")
+        print("=" * 50)
+        
+        # 1. Check oh-my-opendevin repo discovery
+        repo_path = discover_opendevin_repo()
+        if repo_path:
+            print(f"✅ oh-my-opendevin repo: {repo_path}")
+        else:
+            print("❌ oh-my-opendevin repo: not found")
+            print("   Set OH_MY_OPENDEVIN_PATH or clone to one of:")
+            print("   - ~/Code/oh-my-opendevin")
+            print("   - ~/oh-my-opendevin")
+        
+        # 2. Check MCP server availability
+        mcp_config = get_devin_mcp_config()
+        if mcp_config:
+            print("✅ MCP server config: available")
+        else:
+            print("❌ MCP server config: not available")
+            if repo_path:
+                print("   Repo found but MCP config incomplete (check bun installation)")
+        
+        # 3. Check if MCP tools are registered
+        if _devin_mcp_available():
+            print("✅ MCP tools: registered")
+        else:
+            print("❌ MCP tools: not registered")
+            print("   Restart Hermes to load MCP tools")
+        
+        # 4. Check devin CLI
+        import shutil
+        if shutil.which("devin"):
+            print("✅ devin CLI: installed")
+            # Try to get authentication status
+            try:
+                result = subprocess.run(
+                    ["devin", "mcp", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    print("✅ devin CLI: authenticated")
+                else:
+                    print("⚠️  devin CLI: not authenticated (run 'devin login')")
+            except Exception:
+                print("⚠️  devin CLI: authentication check failed")
+        else:
+            print("❌ devin CLI: not installed")
+            print("   Install with: npm install -g devin")
+        
+        # 5. Show active sessions if MCP is available
+        if _devin_mcp_available():
+            try:
+                from tools.devin_delegate import _find_devin_mcp_tool, _call_devin_mcp
+                list_tool = _find_devin_mcp_tool("devin_list_sessions")
+                if list_tool:
+                    print()
+                    print("📋 Active Devin Sessions:")
+                    print("-" * 50)
+                    result = _call_devin_mcp("devin_list_sessions", {"filter_status": "running", "include_output": False})
+                    if "error" not in result:
+                        # Try to parse the result
+                        if "result" in result:
+                            sessions_text = result["result"]
+                            if sessions_text and "no active sessions" not in sessions_text.lower():
+                                print(sessions_text)
+                            else:
+                                print("No active sessions")
+                        else:
+                            print("No active sessions")
+                    else:
+                        print(f"Error listing sessions: {result.get('error', 'unknown')}")
+            except Exception as e:
+                print(f"⚠️  Could not list sessions: {e}")
+        
+        # 6. Show configuration
+        print()
+        print("⚙️  Configuration:")
+        print("-" * 50)
+        try:
+            from hermes_cli.config import get_config_path
+            cfg_path = get_config_path()
+            if cfg_path.exists():
+                import yaml
+                with open(cfg_path, encoding="utf-8") as f:
+                    config = yaml.safe_load(f) or {}
+                enabled_toolsets = config.get("enabled_toolsets", [])
+                if "devin" in enabled_toolsets:
+                    print("✅ devin toolset: enabled")
+                else:
+                    print("❌ devin toolset: disabled")
+                    print("   Enable with: hermes tools enable devin")
+                
+                # Show devin model config
+                devin_model = config.get("devin", {}).get("model") or config.get("delegation", {}).get("devin_model")
+                if devin_model:
+                    print(f"📊 Default model: {devin_model}")
+                else:
+                    print("📊 Default model: kimi-k2.6 (config default)")
+            else:
+                print("⚠️  Config file not found")
+        except Exception as e:
+            print(f"⚠️  Could not read config: {e}")
+        
+        print()
+        print("💡 Quick Actions:")
+        print("-" * 50)
+        print("  hermes tools enable devin     Enable devin toolset")
+        print("  devin login                   Authenticate devin CLI")
+        print("  devin mcp list                Check MCP connection")
+        print("  export OH_MY_OPENDEVIN_PATH=...  Set repo path")
+        print()
 
     def _show_usage(self):
         """Show rate limits (if available) and session token usage."""

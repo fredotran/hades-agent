@@ -1139,18 +1139,36 @@ def _build_child_agent(
 
     # ── Devin role: route to external Devin MCP server instead of AIAgent ──
     if role == "devin":
-        return DevinSubagent(
-            goal=goal,
-            model=model or getattr(parent_agent, "model", None),
-            subagent_id=subagent_id,
-            parent_subagent_id=parent_subagent_id,
-            depth=tui_depth,
-            progress_cb=child_progress_cb,
-            parent_print_fn=getattr(parent_agent, "_print_fn", None),
-            platform=getattr(parent_agent, "platform", None),
-            chat_id=getattr(parent_agent, "_chat_id", None),
-            thread_id=getattr(parent_agent, "_thread_id", None),
-        )
+        # Check if Devin MCP is available before creating DevinSubagent
+        try:
+            from tools.devin_delegate import _devin_mcp_available
+            if not _devin_mcp_available():
+                logger.warning(
+                    "Devin MCP server not available. Falling back to regular subagent. "
+                    "Run '/devin' to check integration status."
+                )
+                # Fall through to regular AIAgent creation below
+                role = "leaf"  # Use regular subagent instead
+            else:
+                return DevinSubagent(
+                    goal=goal,
+                    model=model or getattr(parent_agent, "model", None),
+                    subagent_id=subagent_id,
+                    parent_subagent_id=parent_subagent_id,
+                    depth=tui_depth,
+                    progress_cb=child_progress_cb,
+                    parent_print_fn=getattr(parent_agent, "_print_fn", None),
+                    platform=getattr(parent_agent, "platform", None),
+                    chat_id=getattr(parent_agent, "_chat_id", None),
+                    thread_id=getattr(parent_agent, "_thread_id", None),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not check Devin MCP availability: %s. Falling back to regular subagent.",
+                exc
+            )
+            # Fall through to regular AIAgent creation below
+            role = "leaf"  # Use regular subagent instead
 
     child_thinking_cb = None
     if child_progress_cb:

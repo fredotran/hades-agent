@@ -376,6 +376,332 @@ print(_validate_devin_model("your-model"))  # None = invalid
 
 ---
 
+## Sample Workflows
+
+### Workflow 1: Quick Task Delegation
+
+**Scenario:** You need to quickly refactor a Python function.
+
+```bash
+# In Hermes CLI
+> Refactor this function to use type hints and add docstring
+> [Hermes automatically uses devin_delegate with role="devin"]
+```
+
+**Expected Output:**
+```json
+{
+  "session_id": "abc123",
+  "status": "completed",
+  "summary": "Function refactored with type hints and comprehensive docstring...",
+  "duration_seconds": 45.2,
+  "model": "sonnet"
+}
+```
+
+### Workflow 2: Background Task with Notification
+
+**Scenario:** Start a long-running task in the background and get notified when it completes.
+
+```bash
+# In Hermes CLI (gateway mode)
+> /background Implement a REST API for user authentication using FastAPI
+> [Session starts in background]
+```
+
+**Expected Output (immediate):**
+```json
+{
+  "session_id": "xyz789",
+  "status": "running",
+  "summary": "Devin session xyz789 started (model: sonnet).",
+  "model": "sonnet",
+  "duration_seconds": 0.5
+}
+```
+
+**Expected Output (when complete, via gateway notification):**
+```
+🤖 Devin session xyz789 completed!
+Status: completed
+Duration: 8m 32s
+Summary: REST API implemented with FastAPI, including user registration, login, JWT authentication...
+```
+
+### Workflow 3: Parallel Task Execution
+
+**Scenario:** Run multiple independent tasks concurrently.
+
+```bash
+# In Hermes CLI
+> Implement unit tests for the auth module
+> [Starts session A]
+> Write API documentation for the auth endpoints
+> [Starts session B]
+> Create a Dockerfile for the auth service
+> [Starts session C]
+```
+
+**Check Status:**
+```bash
+# Use the new /devin command to check all sessions
+> /devin
+```
+
+**Expected Output:**
+```
+🤖 Devin Integration Status
+==================================================
+✅ oh-my-opendevin repo: /home/user/Code/oh-my-opendevin
+✅ MCP server config: available
+✅ MCP tools: registered
+✅ devin CLI: installed
+✅ devin CLI: authenticated
+
+📋 Active Devin Sessions:
+--------------------------------------------------
+Session: abc123 (running, age: 2m 15s) - Unit tests
+Session: def456 (running, age: 1m 45s) - API docs
+Session: ghi789 (running, age: 1m 30s) - Dockerfile
+```
+
+### Workflow 4: Error Recovery with Guidance
+
+**Scenario:** Task fails due to quota exhaustion.
+
+```bash
+# In Hermes CLI
+> Implement a complex machine learning pipeline
+```
+
+**Expected Output (with error guidance):**
+```json
+{
+  "error": "QUOTA_EXCEEDED: Model opus quota exhausted",
+  "model": "opus",
+  "attempts": 1,
+  "error_tag": "QUOTA_EXCEEDED",
+  "guidance": "All Devin models in the fallback chain are quota-exceeded.\nTo fix this:\n1. Check your Devin account quota at https://cli.devin.ai\n2. Upgrade your plan if needed\n3. Try again later when quota resets"
+}
+```
+
+**Recovery Action:**
+```bash
+# Check quota and retry with a different model
+> Retry the task using the kimi-k2.6 model instead
+```
+
+### Workflow 5: Session Resume
+
+**Scenario:** Resume a previously interrupted session.
+
+```bash
+# List resumable sessions
+> Use devin_resumable to find sessions I can resume
+```
+
+**Expected Output:**
+```json
+{
+  "resumable_sessions": [
+    {
+      "session_id": "prev123",
+      "status": "error",
+      "summary": "Partial implementation of ML pipeline",
+      "timestamp": "2026-05-17T10:30:00Z"
+    }
+  ]
+}
+```
+
+**Resume Session:**
+```bash
+> Resume session prev123 and complete the ML pipeline
+> [Uses resume parameter in devin_delegate]
+```
+
+### Workflow 6: Metrics and Telemetry
+
+**Scenario:** Monitor Devin usage patterns over time.
+
+**Enable Metrics:**
+```yaml
+# ~/.hermes/config.yaml
+devin:
+  enable_metrics: true
+```
+
+**Check Metrics:**
+```python
+# In Python or via a custom tool
+from tools.devin_delegate import get_devin_metrics
+metrics = json.loads(get_devin_metrics())
+print(f"Success rate: {metrics['success_rate']}%")
+print(f"Average duration: {metrics['average_duration_seconds']}s")
+print(f"Model usage: {metrics['model_usage']}")
+```
+
+**Expected Output:**
+```json
+{
+  "total_sessions": 42,
+  "successful_sessions": 38,
+  "failed_sessions": 3,
+  "cancelled_sessions": 1,
+  "success_rate": 90.48,
+  "average_duration_seconds": 125.5,
+  "model_usage": {
+    "sonnet": 25,
+    "kimi-k2.6": 12,
+    "opus": 5
+  },
+  "error_counts": {
+    "QUOTA_EXCEEDED": 2,
+    "CONTEXT_LIMIT": 1
+  },
+  "session_history": [...]
+}
+```
+
+### Workflow 7: Installation and Setup
+
+**Scenario:** Fresh installation with --with-devin flag.
+
+```bash
+# Run installer with Devin integration
+./scripts/install.sh --with-devin
+```
+
+**Expected Output:**
+```
+Setting up Devin CLI integration...
+
+✅ devin-cli installed
+✅ bun installed
+✅ oh-my-opendevin cloned to ~/oh-my-opendevin
+✅ OH_MY_OPENDEVIN_PATH=~/oh-my-opendevin
+✅ 'devin' toolset added to Hermes config
+✅ Devin config updated with Hermes MCP server
+
+Performing comprehensive Devin integration health check...
+✅ devin CLI found in PATH
+✅ oh-my-opendevin repo structure validated
+✅ bun runtime found (required for oh-my-opendevin MCP server)
+✅ Python verification script passed
+ℹ️  Devin CLI not authenticated or MCP connection not configured
+   Run 'devin login' to authenticate
+   Run 'devin mcp list' to verify MCP connection after authentication
+
+✅ Devin integration setup complete!
+
+Environment variables:
+   OH_MY_OPENDEVIN_PATH=~/oh-my-opendevin
+   Add this to your ~/.bashrc or ~/.zshrc:
+   export OH_MY_OPENDEVIN_PATH=~/oh-my-opendevin
+
+Next steps:
+   devin login          Authenticate with Devin
+   devin mcp list       Verify Hermes MCP server is connected
+   hermes mcp serve     Start Hermes MCP server (for testing)
+```
+
+### Workflow 8: Orphaned Session Recovery
+
+**Scenario:** Clean up sessions left over from a previous Hermes crash.
+
+```python
+from tools.devin_delegate import recover_orphaned_sessions
+result = json.loads(recover_orphaned_sessions())
+print(f"Recovered {result['recovered_bindings']} stale bindings")
+print(f"Cancelled {result['cancelled_stuck_sessions']} stuck sessions")
+```
+
+**Expected Output:**
+```json
+{
+  "recovered_bindings": 3,
+  "cancelled_stuck_sessions": 1,
+  "errors": []
+}
+```
+
+---
+
+## Expected Tool Responses
+
+### devin_delegate (successful completion)
+```json
+{
+  "session_id": "sess-abc123",
+  "status": "completed",
+  "summary": "Task completed successfully. Implemented feature X with tests...",
+  "duration_seconds": 123.45,
+  "model": "sonnet",
+  "error_tag": null
+}
+```
+
+### devin_delegate (with quota fallback)
+```json
+{
+  "session_id": "sess-def456",
+  "status": "completed",
+  "summary": "Task completed after model fallback from opus to sonnet...",
+  "duration_seconds": 234.56,
+  "model": "sonnet",
+  "error_tag": null
+}
+```
+
+### devin_status_check (incremental)
+```json
+{
+  "status": "running",
+  "output": "Currently working on step 3 of 5...",
+  "output_bytes": 2048,
+  "snapshot": {
+    "session_id": "sess-xyz789",
+    "model": "kimi-k2.6",
+    "status": "running"
+  }
+}
+```
+
+### devin_list_sessions
+```json
+{
+  "sessions": [
+    {
+      "session_id": "sess-1",
+      "status": "running",
+      "model": "sonnet",
+      "prompt": "Implement feature X"
+    },
+    {
+      "session_id": "sess-2",
+      "status": "completed",
+      "model": "kimi-k2.6",
+      "prompt": "Fix bug Y"
+    }
+  ]
+}
+```
+
+### devin_health
+```json
+{
+  "healthy": true,
+  "snapshot": {
+    "bun_available": true,
+    "disk_usage": "45%",
+    "slot_usage": "2/10",
+    "orphaned_sessions": 0
+  }
+}
+```
+
+---
+
 ## File Reference
 
 | File | Purpose |

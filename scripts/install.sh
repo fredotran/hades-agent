@@ -1853,21 +1853,80 @@ setup_devin_integration() {
         fi
     fi
 
-    # 3. Clone oh-my-opendevin repo
-    OPENDEVIN_DIR="${OH_MY_OPENDEVIN_DIR:-$HOME/oh-my-opendevin}"
-    if [ -d "$OPENDEVIN_DIR/.git" ]; then
-        log_info "oh-my-opendevin already cloned at $OPENDEVIN_DIR"
+    # 3. Clone oh-my-opendevin repo - prefer ~/Code/oh-my-opendevin if present
+    if [ -d "$HOME/Code/oh-my-opendevin/.git" ]; then
+        OPENDEVIN_DIR="$HOME/Code/oh-my-opendevin"
+        log_info "Using existing oh-my-opendevin at $OPENDEVIN_DIR"
     else
-        log_info "Cloning oh-my-opendevin repository..."
-        if git clone --depth 1 https://github.com/NousResearch/oh-my-opendevin.git "$OPENDEVIN_DIR" 2>/dev/null; then
-            log_success "oh-my-opendevin cloned to $OPENDEVIN_DIR"
+        OPENDEVIN_DIR="${OH_MY_OPENDEVIN_DIR:-$HOME/oh-my-opendevin}"
+        if [ -d "$OPENDEVIN_DIR/.git" ]; then
+            log_info "oh-my-opendevin already cloned at $OPENDEVIN_DIR"
         else
-            log_warn "Failed to clone oh-my-opendevin. Clone manually:"
-            log_info "  git clone https://github.com/NousResearch/oh-my-opendevin.git $OPENDEVIN_DIR"
+            log_info "Cloning oh-my-opendevin repository..."
+            if git clone --depth 1 https://github.com/NousResearch/oh-my-opendevin.git "$OPENDEVIN_DIR" 2>/dev/null; then
+                log_success "oh-my-opendevin cloned to $OPENDEVIN_DIR"
+            else
+                log_warn "Failed to clone oh-my-opendevin. Clone manually:"
+                log_info "  git clone https://github.com/NousResearch/oh-my-opendevin.git $OPENDEVIN_DIR"
+            fi
         fi
     fi
 
-    # 4. Configure Devin to use Hermes MCP server
+    # Set OH_MY_OPENDEVIN_PATH environment variable
+    log_info "Setting OH_MY_OPENDEVIN_PATH=$OPENDEVIN_DIR"
+    export OH_MY_OPENDEVIN_PATH="$OPENDEVIN_DIR"
+
+    # 4. Add "devin" toolset to Hermes config
+    HERMES_CONFIG="$HERMES_HOME/config.yaml"
+    if [ -f "$HERMES_CONFIG" ]; then
+        log_info "Adding 'devin' toolset to Hermes config..."
+        # Check if devin is already in enabled_toolsets
+        if grep -q "^- devin$" "$HERMES_CONFIG" 2>/dev/null; then
+            log_success "'devin' toolset already in config"
+        else
+            # Add devin to enabled_toolsets using Python for reliable YAML manipulation
+            if command -v python3 &> /dev/null || command -v python &> /dev/null; then
+                PYTHON_BIN=$(command -v python3 || command -v python)
+                $PYTHON_BIN -c "
+import yaml
+import sys
+
+try:
+    with open('$HERMES_CONFIG', 'r') as f:
+        config = yaml.safe_load(f)
+    
+    if config is None:
+        config = {}
+    
+    if 'enabled_toolsets' not in config:
+        config['enabled_toolsets'] = []
+    
+    if 'devin' not in config['enabled_toolsets']:
+        config['enabled_toolsets'].append('devin')
+        with open('$HERMES_CONFIG', 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        print('Added devin to enabled_toolsets')
+    else:
+        print('devin already in enabled_toolsets')
+except Exception as e:
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    log_success "'devin' toolset added to Hermes config"
+                else
+                    log_warn "Could not automatically add 'devin' toolset. Add manually to $HERMES_CONFIG:"
+                    log_info "  Add '- devin' to the enabled_toolsets: section"
+                fi
+            else
+                log_warn "Python not available for config update. Add '- devin' to enabled_toolsets in $HERMES_CONFIG"
+            fi
+        fi
+    else
+        log_warn "Hermes config not found at $HERMES_CONFIG"
+    fi
+
+    # 5. Configure Devin to use Hermes MCP server
     DEVIN_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/devin"
     DEVIN_CONFIG="$DEVIN_CONFIG_DIR/config.json"
 
@@ -1925,8 +1984,73 @@ JSONEOF
 JSONEOF
     fi
 
+    # 6. Comprehensive health check
+    echo ""
+    log_info "Performing comprehensive Devin integration health check..."
+    
+    # Check 1: devin CLI availability
+    if command -v devin &> /dev/null; then
+        log_success "devin CLI found in PATH"
+    else
+        log_warn "devin CLI not found in PATH. Ensure npm install -g devin succeeded"
+    fi
+    
+    # Check 2: oh-my-opendevin repo structure
+    if [ -d "$OPENDEVIN_DIR" ]; then
+        if [ -f "$OPENDEVIN_DIR/src/mcp-servers/devin/index.ts" ] && [ -f "$OPENDEVIN_DIR/bin/devin-mcp-launcher.sh" ]; then
+            log_success "oh-my-opendevin repo structure validated"
+        else
+            log_warn "oh-my-opendevin repo structure incomplete. Missing required files."
+        fi
+    else
+        log_warn "oh-my-opendevin directory not found at $OPENDEVIN_DIR"
+    fi
+    
+    # Check 3: bun availability
+    if command -v bun &> /dev/null; then
+        log_success "bun runtime found (required for oh-my-opendevin MCP server)"
+    else
+        log_warn "bun not found in PATH. Install with: curl -fsSL https://bun.sh/install | bash"
+    fi
+    
+    # Check 4: Python verification script (if available)
+    if [ -f "$INSTALL_DIR/tests/tools/verify_devin_integration.py" ]; then
+        log_info "Running Python verification script (safe mode, no API quota used)..."
+        if command -v python3 &> /dev/null || command -v python &> /dev/null; then
+            PYTHON_BIN=$(command -v python3 || command -v python)
+            cd "$INSTALL_DIR"
+            if $PYTHON_BIN tests/tools/verify_devin_integration.py --quiet 2>/dev/null; then
+                log_success "Python verification script passed"
+            else
+                log_warn "Python verification script failed. Run manually for details:"
+                log_info "  cd $INSTALL_DIR && python3 tests/tools/verify_devin_integration.py"
+            fi
+        else
+            log_info "Python not available for verification script"
+        fi
+    else
+        log_info "Verification script not found at $INSTALL_DIR/tests/tools/verify_devin_integration.py"
+    fi
+    
+    # Check 5: devin CLI authentication (optional, may fail if not logged in)
+    if command -v devin &> /dev/null; then
+        log_info "Checking devin CLI authentication (optional)..."
+        if devin mcp list &> /dev/null 2>&1; then
+            log_success "Devin CLI authenticated and MCP connection working"
+        else
+            log_info "Devin CLI not authenticated or MCP connection not configured"
+            log_info "  Run 'devin login' to authenticate"
+            log_info "  Run 'devin mcp list' to verify MCP connection after authentication"
+        fi
+    fi
+
     echo ""
     log_success "Devin integration setup complete!"
+    echo ""
+    echo -e "${CYAN}Environment variables:${NC}"
+    echo -e "   ${YELLOW}OH_MY_OPENDEVIN_PATH${NC}=$OPENDEVIN_DIR"
+    echo -e "   ${YELLOW}  Add this to your ~/.bashrc or ~/.zshrc:${NC}"
+    echo -e "   ${GREEN}  export OH_MY_OPENDEVIN_PATH=$OPENDEVIN_DIR${NC}"
     echo ""
     echo -e "${CYAN}Next steps:${NC}"
     echo -e "   ${GREEN}devin login${NC}          Authenticate with Devin"
