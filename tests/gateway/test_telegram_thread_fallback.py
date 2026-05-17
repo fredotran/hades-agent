@@ -332,7 +332,6 @@ def test_base_gateway_metadata_marks_telegram_dm_topics_as_reply_fallback():
         "thread_id": "20189",
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
-        "direct_messages_topic_id": "20189",
     }
 
 
