@@ -18,6 +18,9 @@ cd hades-agent
 # Run the installer with Devin integration
 bash scripts/install.sh --with-devin
 
+# For development (skip git clone, use current directory)
+bash scripts/install.sh --local --with-devin
+
 # Or configure Hermes as MCP server for devin-cli (one-line installer)
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash
 ```
