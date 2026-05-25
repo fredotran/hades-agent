@@ -2899,7 +2899,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "role": {
                             "type": "string",
-                            "enum": ["leaf", "orchestrator"],
+                            "enum": ["leaf", "orchestrator", "devin"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
                     },
@@ -2912,7 +2912,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "role": {
                 "type": "string",
-                "enum": ["leaf", "orchestrator"],
+                "enum": ["leaf", "orchestrator", "devin"],
                 "description": "(rebuilt at get_definitions() time)",
             },
             "acp_command": {
