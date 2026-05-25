@@ -9721,7 +9721,6 @@ class HermesCLI:
         args = SimpleNamespace(lines=200, expire=7, local=False)
         run_debug_share(args)
 
-<<<<<<< HEAD
     def _handle_devin_command(self, cmd_original: str):
         """Handle /devin — show Devin integration status and session information."""
         import json
@@ -9896,7 +9895,6 @@ class HermesCLI:
         self._pending_relaunch = ["update"]
         return True
 
->>>>>>> upstream/main
     def _show_usage(self):
         """Show rate limits (if available) and session token usage."""
         if not self.agent:
