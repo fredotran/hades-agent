@@ -331,6 +331,63 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 
 ---
 
+## Devin Integration (oh-my-opendevin)
+
+Hermes can delegate tasks to a Devin CLI agent via the oh-my-opendevin repository.
+
+> **Full documentation:** `docs/DEVIN_INTEGRATION.md`
+> **Verification script:** `tests/tools/verify_devin_integration.py`
+
+**Quick start:**
+```bash
+# Verify the integration (safe, no API quota used)
+python3 tests/tools/verify_devin_integration.py
+```
+
+The integration is layered:
+
+**1. MCP server auto-discovery** (`tools/devin_discovery.py`)
+- Searches for `oh-my-opendevin` in 18 common paths
+- Honors `OH_MY_OPENDEVIN_PATH` environment variable
+- Validates markers and checks `bun` availability
+- Injects MCP server config into `discover_mcp_tools()`
+
+**2. High-level tools** (`tools/devin_delegate.py`) — 6 tools:
+- `devin_delegate` — start/wait, model fallback, streaming, error tags
+- `devin_status_check` — incremental polling
+- `devin_list_sessions` — enumerate sessions
+- `devin_cancel` — cancel + unbind
+- `devin_health` — MCP server health snapshot
+- `devin_resumable` — list resumable sessions
+
+**3. Subagent bridge** (`tools/delegate_tool.py`)
+- `role="devin"` routes to `DevinSubagent` (not local `AIAgent`)
+- Full lifecycle: progress callbacks, heartbeat, streaming, timeout
+
+**4. Bidirectional notifications**
+- Background `devin-monitor` daemon polls every 30s
+- Gateway adapter → registered callback → log fallback
+- Auto-purges stale bindings after 24h
+
+**5. Production hardening**
+- Exponential-backoff polling (2s → 60s cap)
+- Config-driven default model (`devin.model` in config.yaml)
+- Model validation (`opus`, `sonnet`, `kimi-k2.6`, `swe` + prefix match)
+- `atexit` session cancellation, thread-safe bindings, TTL cleanup
+
+**Enabling:**
+```yaml
+# ~/.hermes/config.yaml
+enabled_toolsets:
+  - devin
+devin:
+  model: "sonnet"
+```
+
+**Fallback chain:** `opus` → `sonnet` → `kimi-k2.6` → `swe`
+
+---
+
 ## Adding Configuration
 
 ### config.yaml options:

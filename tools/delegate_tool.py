@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -310,7 +311,7 @@ def _looks_like_error_output(content: str) -> bool:
 
 
 def _normalize_role(r: Optional[str]) -> str:
-    """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
+    """Normalise a caller-provided role to 'leaf', 'orchestrator', or 'devin'.
 
     None/empty -> 'leaf'.  Unknown strings coerce to 'leaf' with a
     warning log (matches the silent-degrade pattern of
@@ -320,7 +321,7 @@ def _normalize_role(r: Optional[str]) -> str:
     if r is None or not r:
         return "leaf"
     r_norm = str(r).strip().lower()
-    if r_norm in {"leaf", "orchestrator"}:
+    if r_norm in {"leaf", "orchestrator", "devin"}:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
@@ -867,6 +868,138 @@ def _build_child_progress_callback(
     return _callback
 
 
+class DevinSubagent:
+    """Lightweight stand-in for an AIAgent that routes to the Devin MCP server.
+
+    Used by _build_child_agent when role='devin'.  Implements the minimal
+    surface that _run_single_child expects:
+      - run_conversation(user_message, task_id) -> result dict
+      - interrupt() / close()
+      - get_activity_summary()
+      - _subagent_id, _delegate_role, _delegate_depth, model
+      - tool_progress_callback, _print_fn
+    """
+
+    def __init__(self, goal, model, subagent_id, parent_subagent_id, depth,
+                 progress_cb, parent_print_fn,
+                 platform=None, chat_id=None, thread_id=None, **extra):
+        self.goal = goal
+        # Defer to config-driven default if no model is provided
+        if model:
+            self.model = model
+        else:
+            try:
+                from tools.devin_delegate import _get_default_model
+                self.model = _get_default_model()
+            except Exception:
+                self.model = "kimi-k2.6"
+        self._subagent_id = subagent_id
+        self._parent_subagent_id = parent_subagent_id
+        self._delegate_role = "devin"
+        self._delegate_depth = depth
+        self.tool_progress_callback = progress_cb
+        self._print_fn = parent_print_fn
+        self._interrupt_requested = False
+        self._devin_session_id: Optional[str] = None
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+        self.session_id = subagent_id  # alias for compatibility
+        self._subagent_goal = goal
+        self._platform = platform
+        self._chat_id = chat_id
+        self._thread_id = thread_id
+
+    def _report_progress(self, desc: str) -> None:
+        """Fire the parent progress callback if one was provided."""
+        if self.tool_progress_callback:
+            try:
+                self.tool_progress_callback(
+                    tool_name="devin_delegate",
+                    status="running",
+                    result=desc,
+                )
+            except Exception:
+                pass
+
+    def _stream_to_print(self, chunk: str) -> None:
+        """Forward an incremental output chunk to the parent's print function."""
+        if self._print_fn:
+            try:
+                self._print_fn(chunk)
+            except Exception:
+                pass
+
+    def run_conversation(self, user_message: str, task_id: Optional[str] = None) -> dict:
+        """Call devin_delegate and return an AIAgent-compatible result dict."""
+        self._report_progress("Starting Devin session...")
+        from tools.devin_delegate import devin_delegate
+        result_str = devin_delegate(
+            prompt=user_message,
+            model=self.model,
+            wait=True,
+            task_id=task_id,
+            platform=self._platform,
+            chat_id=self._chat_id,
+            thread_id=self._thread_id,
+            stream_callback=self._stream_to_print,
+        )
+
+        # Parse JSON result from devin_delegate
+        result: dict = {}
+        parse_error = None
+        try:
+            result = json.loads(result_str)
+        except json.JSONDecodeError as exc:
+            parse_error = str(exc)
+            # Attempt to extract session_id with a regex heuristic
+            m = re.search(r'"session_id"\s*:\s*"([^"]+)"', result_str)
+            if m:
+                result["session_id"] = m.group(1)
+            result["summary"] = result_str
+            result["status"] = "unknown"
+            result["error"] = f"JSON parse error: {parse_error}"
+
+        self._devin_session_id = result.get("session_id")
+
+        status = result.get("status", "unknown")
+        summary = result.get("summary", result_str)
+        # Prefer explicit error field, but also surface parse errors
+        error = result.get("error", "")
+        if parse_error and not error:
+            error = f"JSON parse error: {parse_error}"
+
+        return {
+            "final_response": summary,
+            "completed": status == "completed",
+            "interrupted": False,
+            "messages": [],
+            "api_calls": 0,
+            "error": error,
+        }
+
+    def interrupt(self) -> None:
+        self._interrupt_requested = True
+        if self._devin_session_id:
+            from tools.devin_delegate import _call_devin_mcp
+            _call_devin_mcp("devin_cancel", {"session_id": self._devin_session_id})
+
+    def close(self) -> None:
+        pass
+
+    def get_activity_summary(self) -> dict:
+        # Increment a synthetic api_call_count so the parent heartbeat
+        # sees forward progress and never treats a long-running Devin
+        # session as stale.
+        self._heartbeat_counter = getattr(self, "_heartbeat_counter", 0) + 1
+        return {
+            "api_call_count": self._heartbeat_counter,
+            "current_tool": "devin_delegate",
+            "max_iterations": 9999,
+            "last_activity_desc": "delegated to Devin",
+        }
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1003,6 +1136,39 @@ def _build_child_agent(
     # (configurable via delegation.max_iterations, default 50).  This means
     # total iterations across parent + subagents can exceed the parent's
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
+
+    # ── Devin role: route to external Devin MCP server instead of AIAgent ──
+    if role == "devin":
+        # Check if Devin MCP is available before creating DevinSubagent
+        try:
+            from tools.devin_delegate import _devin_mcp_available
+            if not _devin_mcp_available():
+                logger.warning(
+                    "Devin MCP server not available. Falling back to regular subagent. "
+                    "Run '/devin' to check integration status."
+                )
+                # Fall through to regular AIAgent creation below
+                role = "leaf"  # Use regular subagent instead
+            else:
+                return DevinSubagent(
+                    goal=goal,
+                    model=model or getattr(parent_agent, "model", None),
+                    subagent_id=subagent_id,
+                    parent_subagent_id=parent_subagent_id,
+                    depth=tui_depth,
+                    progress_cb=child_progress_cb,
+                    parent_print_fn=getattr(parent_agent, "_print_fn", None),
+                    platform=getattr(parent_agent, "platform", None),
+                    chat_id=getattr(parent_agent, "_chat_id", None),
+                    thread_id=getattr(parent_agent, "_thread_id", None),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not check Devin MCP availability: %s. Falling back to regular subagent.",
+                exc
+            )
+            # Fall through to regular AIAgent creation below
+            role = "leaf"  # Use regular subagent instead
 
     child_thinking_cb = None
     if child_progress_cb:
@@ -2733,7 +2899,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "role": {
                             "type": "string",
-                            "enum": ["leaf", "orchestrator"],
+                            "enum": ["leaf", "orchestrator", "devin"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
                     },
@@ -2746,7 +2912,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "role": {
                 "type": "string",
-                "enum": ["leaf", "orchestrator"],
+                "enum": ["leaf", "orchestrator", "devin"],
                 "description": "(rebuilt at get_definitions() time)",
             },
             "acp_command": {

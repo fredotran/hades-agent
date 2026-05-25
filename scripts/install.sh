@@ -73,6 +73,9 @@ SKIP_BROWSER=false
 BRANCH="main"
 ENSURE_DEPS=""
 POSTINSTALL_MODE=false
+INSTALL_DEVIN=false
+SETUP_DEVIN_MCP=false
+LOCAL_MODE=false
 
 # Detect non-interactive mode (e.g. curl | bash)
 # When stdin is not a terminal, read -p will fail with EOF,
@@ -119,6 +122,18 @@ while [[ $# -gt 0 ]]; do
             POSTINSTALL_MODE=true
             shift
             ;;
+        --with-devin)
+            INSTALL_DEVIN=true
+            shift
+            ;;
+        --setup-devin-mcp)
+            SETUP_DEVIN_MCP=true
+            shift
+            ;;
+        --local)
+            LOCAL_MODE=true
+            shift
+            ;;
         -h|--help)
             echo "Hermes Agent Installer"
             echo ""
@@ -133,6 +148,9 @@ while [[ $# -gt 0 ]]; do
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
+            echo "  --with-devin   Install devin-cli and configure bidirectional integration"
+            echo "  --setup-devin-mcp  Configure Hermes as MCP server for devin-cli"
+            echo "  --local        Use current directory instead of cloning (for development)"
             echo "  -h, --help     Show this help"
             echo ""
             echo "Notes:"
@@ -900,6 +918,20 @@ show_manual_install_hint() {
 # ============================================================================
 
 clone_repo() {
+    # Local mode: use current directory if it's a git repository
+    if [ "$LOCAL_MODE" = true ]; then
+        if [ -d .git ] && git rev-parse --git-dir > /dev/null 2>&1; then
+            INSTALL_DIR="$(pwd)"
+            log_info "Local mode detected: using current directory $INSTALL_DIR"
+            log_success "Skipping clone (using existing repository)"
+            return 0
+        else
+            log_error "Local mode requested but current directory is not a git repository"
+            log_info "Run this script from within the hermes-agent repository"
+            exit 1
+        fi
+    fi
+
     log_info "Installing to $INSTALL_DIR..."
 
     if [ -d "$INSTALL_DIR" ]; then
@@ -1823,6 +1855,288 @@ maybe_start_gateway() {
     fi
 }
 
+setup_devin_integration() {
+    if [ "$INSTALL_DEVIN" != true ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "Setting up Devin CLI integration..."
+    echo ""
+
+    # 1. Install devin-cli via npm
+    if command -v npm &> /dev/null; then
+        log_info "Installing devin-cli via npm..."
+        if npm install -g devin 2>/dev/null; then
+            log_success "devin-cli installed"
+        else
+            log_warn "npm install -g devin failed (may need sudo). Install manually:"
+            log_info "  npm install -g devin && devin login"
+        fi
+    else
+        log_warn "npm not found. Install Node.js first, then:"
+        log_info "  npm install -g devin && devin login"
+        return 0
+    fi
+
+    # 2. Install bun (required by oh-my-opendevin MCP server)
+    if command -v bun &> /dev/null; then
+        log_success "bun already installed"
+    else
+        log_info "Installing bun (required for oh-my-opendevin)..."
+        if curl -fsSL https://bun.sh/install | bash 2>/dev/null; then
+            log_success "bun installed"
+            # Add bun to PATH for this session
+            export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+            export PATH="$BUN_INSTALL/bin:$PATH"
+        else
+            log_warn "bun installation failed. Install manually:"
+            log_info "  curl -fsSL https://bun.sh/install | bash"
+        fi
+    fi
+
+    # 3. Clone oh-my-opendevin repo - prefer ~/Code/oh-my-opendevin if present
+    if [ -d "$HOME/Code/oh-my-opendevin/.git" ]; then
+        OPENDEVIN_DIR="$HOME/Code/oh-my-opendevin"
+        log_info "Using existing oh-my-opendevin at $OPENDEVIN_DIR"
+    else
+        OPENDEVIN_DIR="${OH_MY_OPENDEVIN_DIR:-$HOME/oh-my-opendevin}"
+        if [ -d "$OPENDEVIN_DIR/.git" ]; then
+            log_info "oh-my-opendevin already cloned at $OPENDEVIN_DIR"
+        else
+            log_info "Cloning oh-my-opendevin repository..."
+            if git clone --depth 1 https://github.com/NousResearch/oh-my-opendevin.git "$OPENDEVIN_DIR" 2>/dev/null; then
+                log_success "oh-my-opendevin cloned to $OPENDEVIN_DIR"
+            else
+                log_warn "Failed to clone oh-my-opendevin. Clone manually:"
+                log_info "  git clone https://github.com/NousResearch/oh-my-opendevin.git $OPENDEVIN_DIR"
+            fi
+        fi
+    fi
+
+    # Set OH_MY_OPENDEVIN_PATH environment variable
+    log_info "Setting OH_MY_OPENDEVIN_PATH=$OPENDEVIN_DIR"
+    export OH_MY_OPENDEVIN_PATH="$OPENDEVIN_DIR"
+
+    # 4. Add "devin" toolset to Hermes config
+    HERMES_CONFIG="$HERMES_HOME/config.yaml"
+    if [ -f "$HERMES_CONFIG" ]; then
+        log_info "Adding 'devin' toolset to Hermes config..."
+        # Check if devin is already in enabled_toolsets
+        if grep -q "^- devin$" "$HERMES_CONFIG" 2>/dev/null; then
+            log_success "'devin' toolset already in config"
+        else
+            # Add devin to enabled_toolsets using Python for reliable YAML manipulation
+            if command -v python3 &> /dev/null || command -v python &> /dev/null; then
+                PYTHON_BIN=$(command -v python3 || command -v python)
+                $PYTHON_BIN -c "
+import yaml
+import sys
+
+try:
+    with open('$HERMES_CONFIG', 'r') as f:
+        config = yaml.safe_load(f)
+    
+    if config is None:
+        config = {}
+    
+    if 'enabled_toolsets' not in config:
+        config['enabled_toolsets'] = []
+    
+    if 'devin' not in config['enabled_toolsets']:
+        config['enabled_toolsets'].append('devin')
+        with open('$HERMES_CONFIG', 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        print('Added devin to enabled_toolsets')
+    else:
+        print('devin already in enabled_toolsets')
+except Exception as e:
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    log_success "'devin' toolset added to Hermes config"
+                else
+                    log_warn "Could not automatically add 'devin' toolset. Add manually to $HERMES_CONFIG:"
+                    log_info "  Add '- devin' to the enabled_toolsets: section"
+                fi
+            else
+                log_warn "Python not available for config update. Add '- devin' to enabled_toolsets in $HERMES_CONFIG"
+            fi
+        fi
+    else
+        log_warn "Hermes config not found at $HERMES_CONFIG"
+    fi
+
+    # 5. Configure Devin to use Hermes MCP server
+    DEVIN_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/devin"
+    DEVIN_CONFIG="$DEVIN_CONFIG_DIR/config.json"
+
+    mkdir -p "$DEVIN_CONFIG_DIR"
+
+    # Read existing config or create empty one
+    if [ -f "$DEVIN_CONFIG" ]; then
+        existing_config=$(cat "$DEVIN_CONFIG" 2>/dev/null || echo "{}")
+    else
+        existing_config="{}"
+    fi
+
+    # Merge Hermes MCP server config using Python (more reliable than jq for JSON merging)
+    if command -v python3 &> /dev/null || command -v python &> /dev/null; then
+        PYTHON_BIN=$(command -v python3 || command -v python)
+        merged_config=$($PYTHON_BIN -c "
+import json, sys
+cfg = json.loads('''$existing_config''')
+cfg.setdefault('mcpServers', {})
+cfg['mcpServers']['hermes'] = {
+    'command': 'hermes',
+    'args': ['mcp', 'serve']
+}
+print(json.dumps(cfg, indent=2))
+" 2>/dev/null)
+        if [ -n "$merged_config" ]; then
+            echo "$merged_config" > "$DEVIN_CONFIG"
+            log_success "Devin config updated with Hermes MCP server"
+            log_info "Config file: $DEVIN_CONFIG"
+        else
+            log_warn "Could not update Devin config automatically. Add this manually:"
+            log_info "  $DEVIN_CONFIG"
+            cat <<'JSONEOF'
+{
+  "mcpServers": {
+    "hermes": {
+      "command": "hermes",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+JSONEOF
+        fi
+    else
+        log_warn "Python not available to auto-merge config. Add to $DEVIN_CONFIG:"
+        cat <<'JSONEOF'
+{
+  "mcpServers": {
+    "hermes": {
+      "command": "hermes",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+JSONEOF
+    fi
+
+    # 6. Comprehensive health check
+    echo ""
+    log_info "Performing comprehensive Devin integration health check..."
+    
+    # Check 1: devin CLI availability
+    if command -v devin &> /dev/null; then
+        log_success "devin CLI found in PATH"
+    else
+        log_warn "devin CLI not found in PATH. Ensure npm install -g devin succeeded"
+    fi
+    
+    # Check 2: oh-my-opendevin repo structure
+    if [ -d "$OPENDEVIN_DIR" ]; then
+        if [ -f "$OPENDEVIN_DIR/src/mcp-servers/devin/index.ts" ] && [ -f "$OPENDEVIN_DIR/bin/devin-mcp-launcher.sh" ]; then
+            log_success "oh-my-opendevin repo structure validated"
+        else
+            log_warn "oh-my-opendevin repo structure incomplete. Missing required files."
+        fi
+    else
+        log_warn "oh-my-opendevin directory not found at $OPENDEVIN_DIR"
+    fi
+    
+    # Check 3: bun availability
+    if command -v bun &> /dev/null; then
+        log_success "bun runtime found (required for oh-my-opendevin MCP server)"
+    else
+        log_warn "bun not found in PATH. Install with: curl -fsSL https://bun.sh/install | bash"
+    fi
+    
+    # Check 4: Python verification script (if available)
+    if [ -f "$INSTALL_DIR/tests/tools/verify_devin_integration.py" ]; then
+        log_info "Running Python verification script (safe mode, no API quota used)..."
+        if command -v python3 &> /dev/null || command -v python &> /dev/null; then
+            PYTHON_BIN=$(command -v python3 || command -v python)
+            cd "$INSTALL_DIR"
+            if $PYTHON_BIN tests/tools/verify_devin_integration.py --quiet 2>/dev/null; then
+                log_success "Python verification script passed"
+            else
+                log_warn "Python verification script failed. Run manually for details:"
+                log_info "  cd $INSTALL_DIR && python3 tests/tools/verify_devin_integration.py"
+            fi
+        else
+            log_info "Python not available for verification script"
+        fi
+    else
+        log_info "Verification script not found at $INSTALL_DIR/tests/tools/verify_devin_integration.py"
+    fi
+    
+    # Check 5: devin CLI authentication (optional, may fail if not logged in)
+    if command -v devin &> /dev/null; then
+        log_info "Checking devin CLI authentication (optional)..."
+        if devin mcp list &> /dev/null 2>&1; then
+            log_success "Devin CLI authenticated and MCP connection working"
+        else
+            log_info "Devin CLI not authenticated or MCP connection not configured"
+            log_info "  Run 'devin login' to authenticate"
+            log_info "  Run 'devin mcp list' to verify MCP connection after authentication"
+        fi
+    fi
+
+    echo ""
+    log_success "Devin integration setup complete!"
+    echo ""
+    echo -e "${CYAN}Environment variables:${NC}"
+    echo -e "   ${YELLOW}OH_MY_OPENDEVIN_PATH${NC}=$OPENDEVIN_DIR"
+    echo -e "   ${YELLOW}  Add this to your ~/.bashrc or ~/.zshrc:${NC}"
+    echo -e "   ${GREEN}  export OH_MY_OPENDEVIN_PATH=$OPENDEVIN_DIR${NC}"
+    echo ""
+    echo -e "${CYAN}Next steps:${NC}"
+    echo -e "   ${GREEN}devin login${NC}          Authenticate with Devin"
+    echo -e "   ${GREEN}devin mcp list${NC}       Verify Hermes MCP server is connected"
+    echo -e "   ${GREEN}hermes mcp serve${NC}     Start Hermes MCP server (for testing)"
+    echo ""
+}
+
+setup_devin_mcp() {
+    if [ "$SETUP_DEVIN_MCP" != true ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "Configuring Hermes as MCP server for devin-cli..."
+    echo ""
+
+    # Check if local setup script exists (for development/local install)
+    local setup_script
+    if [ -f "$INSTALL_DIR/scripts/setup-devin-mcp.sh" ]; then
+        setup_script="$INSTALL_DIR/scripts/setup-devin-mcp.sh"
+    else
+        # Download from GitHub
+        setup_script="/tmp/setup-devin-mcp.sh"
+        log_info "Downloading devin MCP setup script..."
+        if ! curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh" -o "$setup_script"; then
+            log_error "Failed to download setup script"
+            log_info "You can run it manually later:"
+            log_info "  curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash"
+            return 1
+        fi
+        chmod +x "$setup_script"
+    fi
+
+    # Run the setup script
+    if bash "$setup_script"; then
+        log_success "Hermes MCP server configured for devin-cli"
+    else
+        log_warn "Devin MCP setup failed. You can run it manually:"
+        log_info "  bash $setup_script"
+        return 1
+    fi
+}
+
 print_success() {
     echo ""
     echo -e "${GREEN}${BOLD}"
@@ -1901,6 +2215,28 @@ print_success() {
             echo "install ripgrep: sudo apt install ripgrep (or brew install ripgrep)"
         fi
         echo -e "${NC}"
+    fi
+
+    # Show Devin integration note if installed
+    if [ "$INSTALL_DEVIN" = true ]; then
+        echo ""
+        echo -e "${CYAN}${BOLD}🔗 Devin Integration:${NC}"
+        echo ""
+        echo -e "   ${GREEN}devin login${NC}          Authenticate with Devin"
+        echo -e "   ${GREEN}devin mcp list${NC}       Verify Hermes MCP server is connected"
+        echo -e "   ${GREEN}hermes mcp serve${NC}     Start Hermes MCP server"
+        echo -e "   ${GREEN}devin${NC}                Start Devin CLI (Hermes tools available)"
+        echo ""
+    fi
+
+    # Show Devin MCP setup note if configured
+    if [ "$SETUP_DEVIN_MCP" = true ]; then
+        echo ""
+        echo -e "${CYAN}${BOLD}🔗 Devin MCP Server:${NC}"
+        echo ""
+        echo -e "   ${GREEN}devin mcp list${NC}       Verify Hermes is listed"
+        echo -e "   ${GREEN}devin mcp call${NC}       Test Hermes MCP tools"
+        echo ""
     fi
 }
 
@@ -2056,6 +2392,8 @@ main() {
     copy_config_templates
     run_setup_wizard
     maybe_start_gateway
+    setup_devin_integration
+    setup_devin_mcp
 
     print_success
 

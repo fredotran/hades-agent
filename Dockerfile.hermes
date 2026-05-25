@@ -1,0 +1,47 @@
+ARG PYTHON_VERSION=3.11
+ARG EXTRAS=""
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc git ca-certificates libffi-dev libssl-dev pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY pyproject.toml /src/
+COPY . /src/
+
+RUN pip install --upgrade pip setuptools wheel \
+ && if [ -z "$EXTRAS" ]; then \
+      pip wheel --no-cache-dir --no-deps --wheel-dir /wheels .; \
+    else \
+      pip wheel --no-cache-dir --no-deps --wheel-dir /wheels ".[${EXTRAS}]"; \
+    fi
+
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HERMES_HOME=/home/hermes/.hermes
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*
+
+# Create a non-root user for runtime
+RUN useradd --create-home --shell /bin/bash -u 1000 hermes || true
+
+# Ensure HERMES_HOME exists and is owned by the hermes user so runtime can write logs
+RUN mkdir -p /home/hermes/.hermes && chown -R hermes:hermes /home/hermes/.hermes
+
+WORKDIR /opt/hermes
+COPY --chown=hermes:hermes . /opt/hermes
+
+VOLUME ["/home/hermes/.hermes"]
+
+ENV PATH="/usr/local/bin:${PATH}"
+USER hermes
+
+ENTRYPOINT ["hermes-agent"]
+CMD ["--help"]

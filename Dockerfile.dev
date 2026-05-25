@@ -1,0 +1,18 @@
+FROM python:3.11-slim AS dev
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HERMES_HOME=/data/hermes
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git ca-certificates libffi-dev libssl-dev gcc \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/hermes
+COPY . /opt/hermes
+
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir -e ".[dev,cli]"
+
+VOLUME ["/data/hermes"]
+EXPOSE 8080
+
+CMD ["hermes", "--tui"]

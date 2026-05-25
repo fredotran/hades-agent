@@ -2167,10 +2167,10 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         self.assertIn("role", props)
-        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator"])
+        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator", "devin"])
         task_props = props["tasks"]["items"]["properties"]
         self.assertIn("role", task_props)
-        self.assertEqual(task_props["role"]["enum"], ["leaf", "orchestrator"])
+        self.assertEqual(task_props["role"]["enum"], ["leaf", "orchestrator", "devin"])
 
     def test_acp_command_description_has_do_not_set_guidance(self):
         # acp_command/acp_args descriptions must NOT bias the model toward

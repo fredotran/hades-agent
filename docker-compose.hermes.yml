@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile.hermes
+      args:
+        PYTHON_VERSION: "3.11"
+        EXTRAS: "web,cli"
+    environment:
+      HERMES_HOME: /data/hermes
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - hermes-data:/data/hermes
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    entrypoint: ["hermes-agent"]
+volumes:
+  hermes-data:

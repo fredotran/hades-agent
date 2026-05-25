@@ -3307,6 +3307,18 @@ def discover_mcp_tools() -> List[str]:
         return []
 
     servers = _load_mcp_config()
+
+    # Auto-discover oh-my-opendevin Devin MCP server if not already configured
+    try:
+        from tools.devin_discovery import get_devin_mcp_config
+        auto_servers = get_devin_mcp_config()
+        if auto_servers:
+            for name, cfg in auto_servers.items():
+                if name not in servers:
+                    servers[name] = cfg
+    except Exception as exc:
+        logger.debug("Devin MCP auto-discovery skipped: %s", exc)
+
     if not servers:
         logger.debug("No MCP servers configured")
         return []
@@ -3335,6 +3347,13 @@ def discover_mcp_tools() -> List[str]:
         if failed_count:
             summary += f" ({failed_count} failed)"
         logger.info(summary)
+
+    # New MCP tools may satisfy previously-failed check_fns (e.g. devin
+    # toolset gated on MCP server availability). Invalidate so the next
+    # get_definitions() re-evaluates fresh.
+    if new_tool_count:
+        from tools.registry import invalidate_check_fn_cache
+        invalidate_check_fn_cache()
 
     return tool_names
 

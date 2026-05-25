@@ -2824,7 +2824,7 @@ class _FakeAiohttpSession:
 
 def _install_fake_aiohttp(monkeypatch, session):
     fake_aiohttp = types.SimpleNamespace(
-        ClientSession=lambda timeout=None, **kwargs: session,
+        ClientSession=lambda timeout=None, trust_env=None: session,
         ClientTimeout=lambda total=None: None,
     )
     monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
@@ -2854,6 +2854,10 @@ class TestGoogleChatStandaloneSend:
         fake_creds = MagicMock()
         fake_creds.token = "the-token"
         fake_creds.refresh = MagicMock(return_value=None)
+
+        # Handle case where Google libraries aren't loaded
+        if _gc_mod.service_account is None:
+            pytest.skip("Google auth libraries not available")
 
         original = _gc_mod.service_account.Credentials.from_service_account_info
         _gc_mod.service_account.Credentials.from_service_account_info = MagicMock(
@@ -2909,6 +2913,10 @@ class TestGoogleChatStandaloneSend:
         fake_creds = MagicMock()
         fake_creds.token = "the-token"
         fake_creds.refresh = MagicMock(return_value=None)
+
+        # Handle case where Google libraries aren't loaded
+        if _gc_mod.service_account is None:
+            pytest.skip("Google auth libraries not available")
 
         original = _gc_mod.service_account.Credentials.from_service_account_info
         _gc_mod.service_account.Credentials.from_service_account_info = MagicMock(

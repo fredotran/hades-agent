@@ -643,8 +643,9 @@ before continuing its own loop. Isolated context + terminal session.
 - **Single:** `delegate_task(goal, context, toolsets)`.
 - **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
   parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
-  (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
+- **Roles:** `leaf` (default; cannot re-delegate), `orchestrator`
+  (can spawn its own workers, bounded by `delegation.max_spawn_depth`),
+  or `devin` (routes to external Devin MCP server via oh-my-opendevin).
 - **Not durable.** If the parent is interrupted, the child is
   cancelled. For work that must outlive the turn, use `cronjob` or
   `terminal(background=True, notify_on_complete=True)`.

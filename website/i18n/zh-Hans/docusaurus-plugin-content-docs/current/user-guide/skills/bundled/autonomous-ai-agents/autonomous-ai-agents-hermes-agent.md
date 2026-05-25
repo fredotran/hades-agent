@@ -635,7 +635,7 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 - **单个：** `delegate_task(goal, context, toolsets)`。
 - **批量：** `delegate_task(tasks=[{goal, ...}, ...])` 并行运行子任务，上限由 `delegation.max_concurrent_children`（默认 3）控制。
-- **角色：** `leaf`（默认；不能再委派）vs `orchestrator`（可以生成自己的 worker，受 `delegation.max_spawn_depth` 限制）。
+- **角色：** `leaf`（默认；不能再委派）、`orchestrator`（可以生成自己的 worker，受 `delegation.max_spawn_depth` 限制）或 `devin`（通过 oh-my-opendevin 路由到外部 Devin MCP 服务器）。
 - **非持久化。** 如果父 agent 被中断，子 agent 会被取消。对于必须在当前轮次之后继续的工作，使用 `cronjob` 或 `terminal(background=True, notify_on_complete=True)`。
 
 配置：`config.yaml` 中的 `delegation.*`。

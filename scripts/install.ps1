@@ -15,6 +15,7 @@
 param(
     [switch]$NoVenv,
     [switch]$SkipSetup,
+    [switch]$WithDevin,
     [string]$Branch = "main",
     # -Commit and -Tag are higher-precedence variants of -Branch for users
     # who need reproducible installs (desktop installer pinning, CI, release
@@ -1940,6 +1941,109 @@ function Start-GatewayIfConfigured {
     }
 }
 
+function Install-DevinIntegration {
+    if (-not $WithDevin) {
+        return
+    }
+
+    Write-Host ""
+    Write-Info "Setting up Devin CLI integration..."
+    Write-Host ""
+
+    # 1. Install devin-cli via npm
+    if ($HasNode) {
+        Write-Info "Installing devin-cli via npm..."
+        try {
+            npm install -g devin 2>$null
+            Write-Success "devin-cli installed"
+        } catch {
+            Write-Warn "npm install -g devin failed. Install manually:"
+            Write-Info "  npm install -g devin && devin login"
+        }
+    } else {
+        Write-Warn "npm not found. Install Node.js first, then:"
+        Write-Info "  npm install -g devin && devin login"
+        return
+    }
+
+    # 2. Install bun (required by oh-my-opendevin MCP server)
+    $bunPath = "$env:USERPROFILE\.bun\bin\bun.exe"
+    if (Get-Command bun -ErrorAction SilentlyContinue -or (Test-Path $bunPath)) {
+        Write-Success "bun already installed"
+    } else {
+        Write-Info "Installing bun (required for oh-my-opendevin)..."
+        try {
+            # On Windows, bun installer is a PowerShell command
+            irm bun.sh/install.ps1 | iex
+            Write-Success "bun installed"
+        } catch {
+            Write-Warn "bun installation failed. Install manually:"
+            Write-Info "  irm bun.sh/install.ps1 | iex"
+        }
+    }
+
+    # 3. Clone oh-my-opendevin repo
+    $openDevinDir = "$env:USERPROFILE\oh-my-opendevin"
+    if (Test-Path "$openDevinDir\.git") {
+        Write-Info "oh-my-opendevin already cloned at $openDevinDir"
+    } else {
+        Write-Info "Cloning oh-my-opendevin repository..."
+        try {
+            git clone --depth 1 https://github.com/NousResearch/oh-my-opendevin.git "$openDevinDir" 2>$null
+            Write-Success "oh-my-opendevin cloned to $openDevinDir"
+        } catch {
+            Write-Warn "Failed to clone oh-my-opendevin. Clone manually:"
+            Write-Info "  git clone https://github.com/NousResearch/oh-my-opendevin.git $openDevinDir"
+        }
+    }
+
+    # 4. Configure Devin to use Hermes MCP server
+    $devinConfigDir = "$env:LOCALAPPDATA\devin"
+    $devinConfig = "$devinConfigDir\config.json"
+    New-Item -ItemType Directory -Force -Path $devinConfigDir | Out-Null
+
+    $existingConfig = @{}
+    if (Test-Path $devinConfig) {
+        try {
+            $existingConfig = Get-Content $devinConfig | ConvertFrom-Json -AsHashtable
+        } catch {
+            $existingConfig = @{
+                mcpServers = @{}
+            }
+        }
+    } else {
+        $existingConfig = @{
+            mcpServers = @{}
+        }
+    }
+
+    $existingConfig['mcpServers']['hermes'] = @{
+        command = 'hermes'
+        args    = @('mcp', 'serve')
+    }
+
+    try {
+        $existingConfig | ConvertTo-Json -Depth 10 | Set-Content $devinConfig -Encoding UTF8
+        Write-Success "Devin config updated with Hermes MCP server"
+        Write-Info "Config file: $devinConfig"
+    } catch {
+        Write-Warn "Could not update Devin config automatically. Add to $devinConfig:"
+        Write-Host '{"mcpServers":{"hermes":{"command":"hermes","args":["mcp","serve"]}}}' -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Success "Devin integration setup complete!"
+    Write-Host ""
+    Write-Host "Next steps:" -ForegroundColor Cyan
+    Write-Host "   devin login          " -NoNewline -ForegroundColor Green
+    Write-Host "Authenticate with Devin"
+    Write-Host "   devin mcp list       " -NoNewline -ForegroundColor Green
+    Write-Host "Verify Hermes MCP server is connected"
+    Write-Host "   hermes mcp serve     " -NoNewline -ForegroundColor Green
+    Write-Host "Start Hermes MCP server (for testing)"
+    Write-Host ""
+}
+
 function Write-Completion {
     Write-Host ""
     Write-Host "+---------------------------------------------------------+" -ForegroundColor Green
@@ -1993,6 +2097,22 @@ function Write-Completion {
     if (-not $HasRipgrep) {
         Write-Host "Note: ripgrep (rg) was not installed. For faster file search:" -ForegroundColor Yellow
         Write-Host "  winget install BurntSushi.ripgrep.MSVC" -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    # Show Devin integration note if installed
+    if ($WithDevin) {
+        Write-Host ""
+        Write-Host "🔗 Devin Integration:" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "   devin login          " -NoNewline -ForegroundColor Green
+        Write-Host "Authenticate with Devin"
+        Write-Host "   devin mcp list       " -NoNewline -ForegroundColor Green
+        Write-Host "Verify Hermes MCP server is connected"
+        Write-Host "   hermes mcp serve     " -NoNewline -ForegroundColor Green
+        Write-Host "Start Hermes MCP server"
+        Write-Host "   devin                " -NoNewline -ForegroundColor Green
+        Write-Host "Start Devin CLI (Hermes tools available)"
         Write-Host ""
     }
 }
@@ -2149,6 +2269,29 @@ function Step-OutOfInstallDir {
             Set-Location $env:USERPROFILE
         }
     } catch {}
+
+    if (-not (Install-Uv)) { throw "uv installation failed — cannot continue" }
+    if (-not (Test-Python)) { throw "Python $PythonVersion not available — cannot continue" }
+    if (-not (Install-Git)) { throw "Git not available and auto-install failed — install from https://git-scm.com/download/win then re-run" }
+    # Test-Node always returns $true (sets $script:HasNode on success, emits a
+    # warning on failure and continues so non-browser installs still work).
+    # Cast to [void] so the bare return value doesn't print "True" to the
+    # console between the "Node found" line and the next installer step.
+    [void](Test-Node)
+    Install-SystemPackages  # ripgrep + ffmpeg in one step
+
+    Install-Repository
+    Install-Venv
+    Install-Dependencies
+    Install-NodeDeps
+    Set-PathVariable
+    Copy-ConfigTemplates
+    Invoke-SetupWizard
+    Install-PlatformSdks
+    Start-GatewayIfConfigured
+    Install-DevinIntegration
+
+    Write-Completion
 }
 
 function Invoke-Stage {

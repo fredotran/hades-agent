@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./:/opt/hermes:delegated
+      - ./dev-data/hermes:/data/hermes
+    environment:
+      HERMES_HOME: /data/hermes
+    ports:
+      - "8080:8080"
+    stdin_open: true
+    tty: true
+    command: ["hermes", "--tui"]

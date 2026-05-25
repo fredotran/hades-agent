@@ -1,0 +1,37 @@
+# Personal, safer docker-compose for local use
+# - Binds dashboard to localhost only
+# - Drops capabilities, sets no-new-privileges, and uses a read-only filesystem
+# - Mounts host ~/.hermes to /opt/data for persistent config and secrets (rw)
+
+version: "3.8"
+services:
+  hermes:
+    build: .
+    image: hermes-agent:personal
+    container_name: hermes-personal
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9119:9119" # dashboard (only when HERMES_DASHBOARD=1)
+    volumes:
+      - ~/.hermes:/opt/data:rw
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=127.0.0.1
+      - HERMES_DASHBOARD_PORT=9119
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+      - /run
+    read_only: true
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    command: ["gateway", "run"]
+    healthcheck:
+      test: ["CMD-SHELL", "hermes doctor --no-prompt >/dev/null 2>&1 || exit 1"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
