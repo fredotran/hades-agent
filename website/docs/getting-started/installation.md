@@ -107,6 +107,22 @@ hermes config set     # Set individual config values
 hermes setup          # Or run the full setup wizard to configure everything at once
 ```
 
+### Configure Hermes as MCP Server for Devin CLI
+
+If you want to use Hermes from devin-cli, run the one-line MCP setup installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash
+```
+
+Or during initial installation:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --setup-devin-mcp
+```
+
+See the [Devin MCP Setup Guide](../DEVIN_INTEGRATION.md#quick-setup) for details.
+
 ---
 
 ## Prerequisites

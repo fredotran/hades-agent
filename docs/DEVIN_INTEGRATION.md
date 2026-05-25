@@ -7,15 +7,16 @@ Hermes can delegate tasks to a Devin CLI agent via the [oh-my-opendevin](https:/
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Prerequisites](#prerequisites)
-3. [Auto-Discovery](#auto-discovery)
-4. [High-Level Tools](#high-level-tools)
-5. [Subagent Bridge](#subagent-bridge)
-6. [Bidirectional Notifications](#bidirectional-notifications)
-7. [Configuration](#configuration)
-8. [Production Hardening](#production-hardening)
-9. [Verification](#verification)
-10. [Troubleshooting](#troubleshooting)
+2. [Quick Setup](#quick-setup)
+3. [Prerequisites](#prerequisites)
+4. [Auto-Discovery](#auto-discovery)
+5. [High-Level Tools](#high-level-tools)
+6. [Subagent Bridge](#subagent-bridge)
+7. [Bidirectional Notifications](#bidirectional-notifications)
+8. [Configuration](#configuration)
+9. [Production Hardening](#production-hardening)
+10. [Verification](#verification)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -49,6 +50,94 @@ The integration is layered:
 **Phase 3 — Subagent bridge:** `role="devin"` in `delegate_task` routes to a `DevinSubagent` proxy instead of spawning a local `AIAgent`.
 
 **Phase 4 — Bidirectional notifications:** When `wait=False`, the session is bound to the current conversation context. A background daemon thread polls active sessions every 30s and pushes completion messages back through the gateway.
+
+---
+
+## Quick Setup
+
+Configure Hermes as an MCP server for devin-cli with one command:
+
+### One-Line Installer
+
+**Linux / macOS / WSL2:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.ps1 | iex
+```
+
+### What the Installer Does
+
+1. Detects devin-cli and Hermes installations
+2. Creates `~/.devin/config.json` (or `%USERPROFILE%\.devin\config.json` on Windows)
+3. Adds the Hermes MCP server configuration
+4. Verifies the configuration is valid
+5. Backs up existing config before modifying
+
+### Advanced Options
+
+**Force overwrite existing configuration:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash -s -- --force
+```
+
+**Use custom Hermes path:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash -s -- --hermes-path /usr/local/bin/hermes
+```
+
+**Use custom devin config location:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash -s -- --devin-config /path/to/config.json
+```
+
+**Verify existing configuration without modifying:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash -s -- --verify-only
+```
+
+### Expected Output
+
+```
+⚕ Hermes Agent — Devin MCP Setup
+
+→ Checking devin-cli...
+✓ devin-cli found: /home/user/.local/bin/devin
+✓ Hermes found on PATH: /home/user/.local/bin/hermes
+✓ jq found — using for JSON manipulation
+→ Verifying Hermes binary...
+✓ Hermes binary is functional
+→ Creating minimal devin config: /home/user/.devin/config.json
+✓ Created minimal devin config
+→ Adding Hermes MCP server configuration...
+✓ Hermes MCP configuration updated
+
+→ Verifying configuration...
+✓ Configuration verified
+
+Hermes MCP Configuration:
+{
+  "command": "/home/user/.local/bin/hermes",
+  "args": ["mcp", "serve"],
+  "env": {
+    "HERMES_HOME": "/home/user/.hermes"
+  }
+}
+
+✓ Setup complete!
+```
+
+### Next Steps
+
+After running the installer:
+1. Restart devin-cli if it's currently running
+2. Run `devin mcp list` — you should see "hermes" listed
+3. Test with: `devin mcp call hermes mcp_hermes_conversations_list`
+
+See the [dedicated setup guide](../getting-started/devin-mcp-setup.md) for manual setup, troubleshooting, and advanced configuration.
 
 ---
 

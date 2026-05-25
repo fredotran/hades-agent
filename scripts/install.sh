@@ -74,6 +74,8 @@ BRANCH="main"
 ENSURE_DEPS=""
 POSTINSTALL_MODE=false
 INSTALL_DEVIN=false
+SETUP_DEVIN_MCP=false
+LOCAL_MODE=false
 
 # Detect non-interactive mode (e.g. curl | bash)
 # When stdin is not a terminal, read -p will fail with EOF,
@@ -124,6 +126,14 @@ while [[ $# -gt 0 ]]; do
             INSTALL_DEVIN=true
             shift
             ;;
+        --setup-devin-mcp)
+            SETUP_DEVIN_MCP=true
+            shift
+            ;;
+        --local)
+            LOCAL_MODE=true
+            shift
+            ;;
         -h|--help)
             echo "Hermes Agent Installer"
             echo ""
@@ -139,6 +149,8 @@ while [[ $# -gt 0 ]]; do
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
             echo "  --hermes-home PATH  Data directory (default: ~/.hermes, or \$HERMES_HOME)"
             echo "  --with-devin   Install devin-cli and configure bidirectional integration"
+            echo "  --setup-devin-mcp  Configure Hermes as MCP server for devin-cli"
+            echo "  --local        Use current directory instead of cloning (for development)"
             echo "  -h, --help     Show this help"
             echo ""
             echo "Notes:"
@@ -906,6 +918,20 @@ show_manual_install_hint() {
 # ============================================================================
 
 clone_repo() {
+    # Local mode: use current directory if it's a git repository
+    if [ "$LOCAL_MODE" = true ]; then
+        if [ -d .git ] && git rev-parse --git-dir > /dev/null 2>&1; then
+            INSTALL_DIR="$(pwd)"
+            log_info "Local mode detected: using current directory $INSTALL_DIR"
+            log_success "Skipping clone (using existing repository)"
+            return 0
+        else
+            log_error "Local mode requested but current directory is not a git repository"
+            log_info "Run this script from within the hermes-agent repository"
+            exit 1
+        fi
+    fi
+
     log_info "Installing to $INSTALL_DIR..."
 
     if [ -d "$INSTALL_DIR" ]; then
@@ -2059,6 +2085,42 @@ JSONEOF
     echo ""
 }
 
+setup_devin_mcp() {
+    if [ "$SETUP_DEVIN_MCP" != true ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "Configuring Hermes as MCP server for devin-cli..."
+    echo ""
+
+    # Check if local setup script exists (for development/local install)
+    local setup_script
+    if [ -f "$INSTALL_DIR/scripts/setup-devin-mcp.sh" ]; then
+        setup_script="$INSTALL_DIR/scripts/setup-devin-mcp.sh"
+    else
+        # Download from GitHub
+        setup_script="/tmp/setup-devin-mcp.sh"
+        log_info "Downloading devin MCP setup script..."
+        if ! curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh" -o "$setup_script"; then
+            log_error "Failed to download setup script"
+            log_info "You can run it manually later:"
+            log_info "  curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/setup-devin-mcp.sh | bash"
+            return 1
+        fi
+        chmod +x "$setup_script"
+    fi
+
+    # Run the setup script
+    if bash "$setup_script"; then
+        log_success "Hermes MCP server configured for devin-cli"
+    else
+        log_warn "Devin MCP setup failed. You can run it manually:"
+        log_info "  bash $setup_script"
+        return 1
+    fi
+}
+
 print_success() {
     echo ""
     echo -e "${GREEN}${BOLD}"
@@ -2148,6 +2210,16 @@ print_success() {
         echo -e "   ${GREEN}devin mcp list${NC}       Verify Hermes MCP server is connected"
         echo -e "   ${GREEN}hermes mcp serve${NC}     Start Hermes MCP server"
         echo -e "   ${GREEN}devin${NC}                Start Devin CLI (Hermes tools available)"
+        echo ""
+    fi
+
+    # Show Devin MCP setup note if configured
+    if [ "$SETUP_DEVIN_MCP" = true ]; then
+        echo ""
+        echo -e "${CYAN}${BOLD}🔗 Devin MCP Server:${NC}"
+        echo ""
+        echo -e "   ${GREEN}devin mcp list${NC}       Verify Hermes is listed"
+        echo -e "   ${GREEN}devin mcp call${NC}       Test Hermes MCP tools"
         echo ""
     fi
 }
@@ -2259,6 +2331,7 @@ main() {
     run_setup_wizard
     maybe_start_gateway
     setup_devin_integration
+    setup_devin_mcp
 
     print_success
 }
